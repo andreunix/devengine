@@ -55,17 +55,9 @@ type Index struct {
 
 // Constraint describes a table constraint (PK, FK, unique, check).
 type Constraint struct {
-	Name       string   `json:"name"`
-	Type       string   `json:"type"` // p=primary key, f=foreign key, u=unique, c=check
-	Columns    []string `json:"columns,omitempty"`
-	ForeignKey *FKRef   `json:"foreign_key,omitempty"`
-	CheckExpr  string   `json:"check_expr,omitempty"`
-}
-
-// FKRef describes the target of a foreign key constraint.
-type FKRef struct {
-	Table   string   `json:"table"`
-	Columns []string `json:"columns"`
+	Name       string `json:"name"`
+	Type       string `json:"type"`       // p=primary key, f=foreign key, u=unique, c=check
+	Definition string `json:"definition"` // Canonical SQL definition
 }
 
 // ignoreTable reports whether a table should be excluded from snapshots.
@@ -103,18 +95,21 @@ func Capture(ctx context.Context, pool *pgxpool.Pool) (*Snapshot, error) {
 func captureColumns(ctx context.Context, pool *pgxpool.Pool, snap *Snapshot) error {
 	rows, err := pool.Query(ctx, `
 		SELECT
-			c.table_name,
-			c.column_name,
-			c.data_type,
-			c.is_nullable = 'YES' AS nullable,
-			c.column_default,
-			c.ordinal_position
-		FROM information_schema.columns c
-		JOIN information_schema.tables t
-			ON t.table_schema = c.table_schema AND t.table_name = c.table_name
-		WHERE c.table_schema = 'public'
-		  AND t.table_type = 'BASE TABLE'
-		ORDER BY c.table_name, c.ordinal_position
+			c.relname AS table_name,
+			a.attname AS column_name,
+			format_type(a.atttypid, a.atttypmod) AS data_type,
+			NOT a.attnotnull AS nullable,
+			pg_get_expr(ad.adbin, ad.adrelid) AS column_default,
+			a.attnum AS ordinal_position
+		FROM pg_attribute a
+		JOIN pg_class c ON c.oid = a.attrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		LEFT JOIN pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
+		WHERE n.nspname = 'public'
+		  AND c.relkind = 'r'
+		  AND a.attnum > 0
+		  AND NOT a.attisdropped
+		ORDER BY c.relname, a.attnum
 	`)
 	if err != nil {
 		return err
@@ -209,28 +204,16 @@ func captureIndexes(ctx context.Context, pool *pgxpool.Pool, snap *Snapshot) err
 func captureConstraints(ctx context.Context, pool *pgxpool.Pool, snap *Snapshot) error {
 	rows, err := pool.Query(ctx, `
 		SELECT
-			tc.table_name,
-			tc.constraint_name,
-			tc.constraint_type,
-			ARRAY_AGG(kcu.column_name ORDER BY kcu.ordinal_position) FILTER (WHERE kcu.column_name IS NOT NULL) AS columns,
-			ccu.table_name AS fk_table,
-			ARRAY_AGG(ccu.column_name ORDER BY kcu.ordinal_position) FILTER (WHERE ccu.column_name IS NOT NULL AND tc.constraint_type = 'FOREIGN KEY') AS fk_columns,
-			cc.check_clause
-		FROM information_schema.table_constraints tc
-		LEFT JOIN information_schema.key_column_usage kcu
-			ON kcu.constraint_name = tc.constraint_name
-			AND kcu.table_schema = tc.table_schema
-		LEFT JOIN information_schema.constraint_column_usage ccu
-			ON ccu.constraint_name = tc.constraint_name
-			AND ccu.table_schema = tc.table_schema
-		LEFT JOIN information_schema.check_constraints cc
-			ON cc.constraint_name = tc.constraint_name
-			AND cc.constraint_schema = tc.constraint_schema
-		WHERE tc.table_schema = 'public'
-		  AND tc.constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY', 'UNIQUE', 'CHECK')
-		GROUP BY tc.table_name, tc.constraint_name, tc.constraint_type,
-		         ccu.table_name, cc.check_clause
-		ORDER BY tc.table_name, tc.constraint_name
+			c.relname AS table_name,
+			con.conname AS constraint_name,
+			con.contype::text AS constraint_type,
+			pg_get_constraintdef(con.oid) AS definition
+		FROM pg_constraint con
+		JOIN pg_class c ON c.oid = con.conrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public'
+		  AND con.contype IN ('p', 'f', 'u', 'c')
+		ORDER BY c.relname, con.conname
 	`)
 	if err != nil {
 		return err
@@ -238,15 +221,8 @@ func captureConstraints(ctx context.Context, pool *pgxpool.Pool, snap *Snapshot)
 	defer rows.Close()
 
 	for rows.Next() {
-		var (
-			tableName, constraintName, constraintType string
-			columns                                   []string
-			fkTable                                   *string
-			fkColumns                                 []string
-			checkExpr                                 *string
-		)
-		if err := rows.Scan(&tableName, &constraintName, &constraintType, &columns,
-			&fkTable, &fkColumns, &checkExpr); err != nil {
+		var tableName, constraintName, constraintType, definition string
+		if err := rows.Scan(&tableName, &constraintName, &constraintType, &definition); err != nil {
 			return err
 		}
 		if ignoreTable(tableName) {
@@ -257,18 +233,11 @@ func captureConstraints(ctx context.Context, pool *pgxpool.Pool, snap *Snapshot)
 			tbl = &Table{Name: tableName}
 			snap.Tables[tableName] = tbl
 		}
-		c := Constraint{
-			Name:    constraintName,
-			Type:    constraintType,
-			Columns: columns,
-		}
-		if fkTable != nil && len(fkColumns) > 0 {
-			c.ForeignKey = &FKRef{Table: *fkTable, Columns: fkColumns}
-		}
-		if checkExpr != nil {
-			c.CheckExpr = *checkExpr
-		}
-		tbl.Constraints = append(tbl.Constraints, c)
+		tbl.Constraints = append(tbl.Constraints, Constraint{
+			Name:       constraintName,
+			Type:       constraintType,
+			Definition: definition,
+		})
 	}
 	return rows.Err()
 }
@@ -349,14 +318,20 @@ func UnmarshalSnapshot(data []byte) (*Snapshot, error) {
 type DriftKind string
 
 const (
-	DriftTableAdded    DriftKind = "table_added"
-	DriftTableRemoved  DriftKind = "table_removed"
-	DriftColumnAdded   DriftKind = "column_added"
-	DriftColumnRemoved DriftKind = "column_removed"
-	DriftColumnChanged DriftKind = "column_changed"
-	DriftIndexAdded    DriftKind = "index_added"
-	DriftIndexRemoved  DriftKind = "index_removed"
-	DriftEnumChanged   DriftKind = "enum_changed"
+	DriftTableAdded        DriftKind = "table_added"
+	DriftTableRemoved      DriftKind = "table_removed"
+	DriftColumnAdded       DriftKind = "column_added"
+	DriftColumnRemoved     DriftKind = "column_removed"
+	DriftColumnChanged     DriftKind = "column_changed"
+	DriftIndexAdded        DriftKind = "index_added"
+	DriftIndexRemoved      DriftKind = "index_removed"
+	DriftIndexChanged      DriftKind = "index_changed"
+	DriftConstraintAdded   DriftKind = "constraint_added"
+	DriftConstraintRemoved DriftKind = "constraint_removed"
+	DriftConstraintChanged DriftKind = "constraint_changed"
+	DriftSequenceAdded     DriftKind = "sequence_added"
+	DriftSequenceRemoved   DriftKind = "sequence_removed"
+	DriftEnumChanged       DriftKind = "enum_changed"
 )
 
 // DriftEntry describes a single schema difference.
@@ -403,7 +378,11 @@ func compare(base, live *Snapshot) DriftResult {
 		entries = append(entries, diffColumns(name, base.Tables[name], live.Tables[name])...)
 		// Compare indexes.
 		entries = append(entries, diffIndexes(name, base.Tables[name], live.Tables[name])...)
+		// Compare constraints.
+		entries = append(entries, diffConstraints(name, base.Tables[name], live.Tables[name])...)
 	}
+	// Sequences.
+	entries = append(entries, diffSequences(base.Sequences, live.Sequences)...)
 	// Enums.
 	entries = append(entries, diffEnums(base.Enums, live.Enums)...)
 
@@ -430,12 +409,20 @@ func diffColumns(tableName string, base, live *Table) []DriftEntry {
 			entries = append(entries, DriftEntry{Kind: DriftColumnRemoved, Table: tableName, Object: name})
 			continue
 		}
-		if col.DataType != liveCol.DataType || col.IsNullable != liveCol.IsNullable {
+		defaultBase := ""
+		if col.Default != nil {
+			defaultBase = *col.Default
+		}
+		defaultLive := ""
+		if liveCol.Default != nil {
+			defaultLive = *liveCol.Default
+		}
+		if col.DataType != liveCol.DataType || col.IsNullable != liveCol.IsNullable || defaultBase != defaultLive {
 			entries = append(entries, DriftEntry{
 				Kind:   DriftColumnChanged,
 				Table:  tableName,
 				Object: name,
-				Detail: fmt.Sprintf("type: %s→%s nullable: %v→%v", col.DataType, liveCol.DataType, col.IsNullable, liveCol.IsNullable),
+				Detail: fmt.Sprintf("type: %s→%s nullable: %v→%v default: %v→%v", col.DataType, liveCol.DataType, col.IsNullable, liveCol.IsNullable, defaultBase, defaultLive),
 			})
 		}
 	}
@@ -457,9 +444,75 @@ func diffIndexes(tableName string, base, live *Table) []DriftEntry {
 			entries = append(entries, DriftEntry{Kind: DriftIndexAdded, Table: tableName, Object: name})
 		}
 	}
-	for name := range baseIdx {
-		if _, ok := liveIdx[name]; !ok {
+	for name, col := range baseIdx {
+		liveCol, ok := liveIdx[name]
+		if !ok {
 			entries = append(entries, DriftEntry{Kind: DriftIndexRemoved, Table: tableName, Object: name})
+			continue
+		}
+		if col.Definition != liveCol.Definition {
+			entries = append(entries, DriftEntry{
+				Kind:   DriftIndexChanged,
+				Table:  tableName,
+				Object: name,
+				Detail: fmt.Sprintf("def: %s→%s", col.Definition, liveCol.Definition),
+			})
+		}
+	}
+	return entries
+}
+
+func diffConstraints(tableName string, base, live *Table) []DriftEntry {
+	var entries []DriftEntry
+	baseCon := make(map[string]Constraint)
+	for _, c := range base.Constraints {
+		baseCon[c.Name] = c
+	}
+	liveCon := make(map[string]Constraint)
+	for _, c := range live.Constraints {
+		liveCon[c.Name] = c
+	}
+	for name := range liveCon {
+		if _, ok := baseCon[name]; !ok {
+			entries = append(entries, DriftEntry{Kind: DriftConstraintAdded, Table: tableName, Object: name})
+		}
+	}
+	for name, c := range baseCon {
+		liveC, ok := liveCon[name]
+		if !ok {
+			entries = append(entries, DriftEntry{Kind: DriftConstraintRemoved, Table: tableName, Object: name})
+			continue
+		}
+		if c.Definition != liveC.Definition {
+			entries = append(entries, DriftEntry{
+				Kind:   DriftConstraintChanged,
+				Table:  tableName,
+				Object: name,
+				Detail: fmt.Sprintf("def: %s→%s", c.Definition, liveC.Definition),
+			})
+		}
+	}
+	return entries
+}
+
+func diffSequences(base, live []string) []DriftEntry {
+	var entries []DriftEntry
+	baseMap := make(map[string]bool)
+	for _, s := range base {
+		baseMap[s] = true
+	}
+	liveMap := make(map[string]bool)
+	for _, s := range live {
+		liveMap[s] = true
+	}
+	for s := range liveMap {
+		if !baseMap[s] {
+			entries = append(entries, DriftEntry{Kind: DriftSequenceAdded, Object: s})
+		}
+	}
+	for s := range baseMap {
+		if !liveMap[s] {
+			entries = append(entries, DriftEntry{Kind: DriftSequenceRemoved, Object: s})
 		}
 	}
 	return entries

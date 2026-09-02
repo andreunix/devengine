@@ -80,14 +80,14 @@ func TestDuplicateVersionRejected(t *testing.T) {
 
 func TestMetadataTableDefault(t *testing.T) {
 	r := Runner{}
-	if got := r.metadataTable(); got != defaultMetadataTable {
-		t.Fatalf("expected %q, got %q", defaultMetadataTable, got)
+	if r.metadataTable() != `"_devengine_migrations"` {
+		t.Errorf("expected \"_devengine_migrations\", got %q", r.metadataTable())
 	}
 }
 
 func TestMetadataTableOverride(t *testing.T) {
-	r := Runner{MetadataTable: "_custom_migrations"}
-	if got := r.metadataTable(); got != "_custom_migrations" {
-		t.Fatalf("expected %q, got %q", "_custom_migrations", got)
+	r := Runner{MetadataTable: "  _custom_migrations  "}
+	if r.metadataTable() != `"_custom_migrations"` {
+		t.Errorf("expected \"_custom_migrations\", got %q", r.metadataTable())
 	}
 }

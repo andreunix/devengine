@@ -65,15 +65,16 @@ func NewIsolatedDatabase(t *testing.T) *postgres.DB {
 	if err != nil {
 		t.Fatalf("testpostgres: admin pool: %v", err)
 	}
-	defer adminPool.Close()
 
 	// Generate a unique database name to avoid collisions in parallel runs.
 	dbName := fmt.Sprintf("test_%s_%d", sanitize(t.Name()), rand.Int64())
 	if _, err := adminPool.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %q`, dbName)); err != nil {
+		adminPool.Close()
 		t.Fatalf("testpostgres: create database %q: %v", dbName, err)
 	}
 
 	t.Cleanup(func() {
+		defer adminPool.Close()
 		dropCtx := context.Background()
 		// Terminate connections before dropping to avoid "database in use" errors.
 		_, _ = adminPool.Exec(dropCtx,

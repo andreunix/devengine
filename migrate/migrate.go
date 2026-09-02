@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -53,6 +54,7 @@ type MigrationStatus struct {
 	Source    SourceKind
 	Checksum  string
 	AppliedAt *time.Time // nil when pending
+	Drift     bool       // true if the stored checksum differs from the file's checksum
 }
 
 // Runner executes migrations against a pgxpool.Pool.
@@ -75,10 +77,11 @@ type migration struct {
 }
 
 func (r Runner) metadataTable() string {
-	if t := strings.TrimSpace(r.MetadataTable); t != "" {
-		return t
+	t := defaultMetadataTable
+	if trimmed := strings.TrimSpace(r.MetadataTable); trimmed != "" {
+		t = trimmed
 	}
-	return defaultMetadataTable
+	return pgx.Identifier{t}.Sanitize()
 }
 
 // Apply acquires a PostgreSQL advisory lock, creates the metadata table if
@@ -145,6 +148,10 @@ func (r Runner) Status(ctx context.Context) ([]MigrationStatus, error) {
 	rows, err := r.Pool.Query(ctx,
 		fmt.Sprintf(`SELECT version, checksum, applied_at FROM %s`, table))
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42P01" { // undefined_table
+			return r.pendingStatus(migrations), nil
+		}
 		return nil, fmt.Errorf("migrate: query status: %w", err)
 	}
 	defer rows.Close()
@@ -182,10 +189,26 @@ func (r Runner) Status(ctx context.Context) ([]MigrationStatus, error) {
 		if a, ok := applied[m.Version]; ok {
 			t := a.appliedAt
 			ms.AppliedAt = &t
+			if a.checksum != m.Checksum {
+				ms.Drift = true
+			}
 		}
 		out = append(out, ms)
 	}
 	return out, nil
+}
+
+func (r Runner) pendingStatus(migrations []migration) []MigrationStatus {
+	out := make([]MigrationStatus, 0, len(migrations))
+	for _, m := range migrations {
+		out = append(out, MigrationStatus{
+			Version:  m.Version,
+			Name:     m.Name,
+			Source:   m.Source,
+			Checksum: m.Checksum,
+		})
+	}
+	return out
 }
 
 func (r Runner) applyOne(ctx context.Context, conn *pgx.Conn, item migration, table string) error {

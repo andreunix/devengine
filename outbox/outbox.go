@@ -180,31 +180,26 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 	table := r.Config.table()
 	batch := r.Config.batchSize()
 	maxAttempts := r.Config.maxAttempts()
+	leaseDuration := 5 * time.Minute
 
-	conn, err := r.Pool.Acquire(ctx)
+	// Claim messages and lease them so other workers don't pick them up.
+	rows, err := r.Pool.Query(ctx, fmt.Sprintf(`
+		UPDATE %s
+		SET process_after = NOW() + $2::interval
+		WHERE id IN (
+			SELECT id
+			FROM %s
+			WHERE processed_at IS NULL
+			  AND failed_at IS NULL
+			  AND process_after <= NOW()
+			ORDER BY occurred_at
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id, event_type, aggregate_id, aggregate_type, payload, schema_version, occurred_at, attempt
+	`, table, table), batch, fmt.Sprintf("%d seconds", int(leaseDuration.Seconds())))
 	if err != nil {
-		return fmt.Errorf("outbox: acquire connection: %w", err)
-	}
-	defer conn.Release()
-
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("outbox: begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	rows, err := tx.Query(ctx, fmt.Sprintf(`
-		SELECT id, event_type, aggregate_id, aggregate_type, payload, schema_version, occurred_at, attempt
-		FROM %s
-		WHERE processed_at IS NULL
-		  AND failed_at IS NULL
-		  AND process_after <= NOW()
-		ORDER BY occurred_at
-		LIMIT $1
-		FOR UPDATE SKIP LOCKED
-	`, table), batch)
-	if err != nil {
-		return fmt.Errorf("outbox: query batch: %w", err)
+		return fmt.Errorf("outbox: claim batch: %w", err)
 	}
 
 	var messages []outboxRow
@@ -213,13 +208,13 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 		if err := rows.Scan(&m.id, &m.eventType, &m.aggregateID, &m.aggregateType,
 			&m.payload, &m.schemaVersion, &m.occurredAt, &m.attempt); err != nil {
 			rows.Close()
-			return fmt.Errorf("outbox: scan row: %w", err)
+			return fmt.Errorf("outbox: scan claim row: %w", err)
 		}
 		messages = append(messages, m)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("outbox: iterate rows: %w", err)
+		return fmt.Errorf("outbox: iterate claim rows: %w", err)
 	}
 
 	for _, m := range messages {
@@ -237,41 +232,47 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 		nextAttempt := m.attempt + 1
 
 		if deliveryErr == nil {
-			_, err = tx.Exec(ctx, fmt.Sprintf(`
+			_, err = r.Pool.Exec(ctx, fmt.Sprintf(`
 				UPDATE %s SET processed_at = NOW() WHERE id = $1
 			`, table), m.id)
-		} else if nextAttempt >= maxAttempts {
-			logger.Error("outbox: message failed permanently",
-				"id", m.id, "type", m.eventType, "attempts", nextAttempt, "error", deliveryErr)
-			_, err = tx.Exec(ctx, fmt.Sprintf(`
-				UPDATE %s SET failed_at = NOW(), attempt = $2, last_error = $3 WHERE id = $1
-			`, table), m.id, nextAttempt, deliveryErr.Error())
 		} else {
-			backoff := r.backoff(nextAttempt)
-			logger.Warn("outbox: delivery failed, will retry",
-				"id", m.id, "type", m.eventType, "attempt", nextAttempt, "retry_after", backoff)
-			_, err = tx.Exec(ctx, fmt.Sprintf(`
-				UPDATE %s SET attempt = $2, process_after = NOW() + $3::interval, last_error = $4 WHERE id = $1
-			`, table), m.id, nextAttempt,
-				fmt.Sprintf("%d milliseconds", int(backoff.Milliseconds())),
-				deliveryErr.Error())
+			errMsg := deliveryErr.Error()
+			if len(errMsg) > 1024 {
+				errMsg = errMsg[:1024]
+			}
+			if nextAttempt >= maxAttempts {
+				logger.Error("outbox: message failed permanently",
+					"id", m.id, "type", m.eventType, "attempts", nextAttempt, "error", deliveryErr)
+				_, err = r.Pool.Exec(ctx, fmt.Sprintf(`
+					UPDATE %s SET failed_at = NOW(), attempt = $2, last_error = $3 WHERE id = $1
+				`, table), m.id, nextAttempt, errMsg)
+			} else {
+				backoff := r.backoff(nextAttempt)
+				logger.Warn("outbox: delivery failed, will retry",
+					"id", m.id, "type", m.eventType, "attempt", nextAttempt, "retry_after", backoff)
+				_, err = r.Pool.Exec(ctx, fmt.Sprintf(`
+					UPDATE %s SET attempt = $2, process_after = NOW() + $3::interval, last_error = $4 WHERE id = $1
+				`, table), m.id, nextAttempt,
+					fmt.Sprintf("%d milliseconds", int(backoff.Milliseconds())),
+					errMsg)
+			}
 		}
 		if err != nil {
-			return fmt.Errorf("outbox: update message %s: %w", m.id, err)
+			logger.Error("outbox: failed to update message outcome", "id", m.id, "error", err)
 		}
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("outbox: commit batch: %w", err)
-	}
 	return nil
 }
 
 func (r *Relay) deliver(ctx context.Context, event events.Event) error {
 	if r.Registry == nil {
-		return nil
+		return errors.New("outbox: no event registry configured")
 	}
 	handlers := r.Registry.HandlersFor(event.Type)
+	if len(handlers) == 0 {
+		return fmt.Errorf("outbox: no handlers registered for event type %q", event.Type)
+	}
 	var errs []error
 	for _, h := range handlers {
 		if err := h.Handle(ctx, event); err != nil {

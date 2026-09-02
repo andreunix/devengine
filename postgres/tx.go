@@ -47,7 +47,7 @@ var defaultRetryConfig = RetryConfig{
 //
 // Non-transient errors, context cancellation, and business errors are never
 // retried. If fn returns nil, the transaction (or savepoint) is committed.
-func (db *DB) WithTransaction(ctx context.Context, fn func(pgx.Tx) error, cfgs ...RetryConfig) error {
+func (db *DB) WithTransaction(ctx context.Context, fn func(context.Context, pgx.Tx) error, cfgs ...RetryConfig) error {
 	cfg := defaultRetryConfig
 	if len(cfgs) > 0 {
 		cfg = cfgs[0]
@@ -114,7 +114,7 @@ func InjectTx(ctx context.Context, tx pgx.Tx) context.Context {
 }
 
 // runInTx opens a transaction, calls fn, and commits or rolls back.
-func (db *DB) runInTx(ctx context.Context, fn func(pgx.Tx) error) error {
+func (db *DB) runInTx(ctx context.Context, fn func(context.Context, pgx.Tx) error) error {
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("postgres: begin transaction: %w", err)
@@ -122,7 +122,7 @@ func (db *DB) runInTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	txCtx := context.WithValue(ctx, txKey{}, tx)
-	if err := fn(tx); err != nil {
+	if err := fn(txCtx, tx); err != nil {
 		return err
 	}
 	if err := tx.Commit(txCtx); err != nil {
@@ -132,7 +132,7 @@ func (db *DB) runInTx(ctx context.Context, fn func(pgx.Tx) error) error {
 }
 
 // withSavepoint wraps fn in a SAVEPOINT / RELEASE or ROLLBACK TO SAVEPOINT.
-func withSavepoint(ctx context.Context, tx pgx.Tx, fn func(pgx.Tx) error) error {
+func withSavepoint(ctx context.Context, tx pgx.Tx, fn func(context.Context, pgx.Tx) error) error {
 	// pgx provides a NestedTransaction helper that manages savepoints.
 	nested, err := tx.Begin(ctx)
 	if err != nil {
@@ -140,7 +140,8 @@ func withSavepoint(ctx context.Context, tx pgx.Tx, fn func(pgx.Tx) error) error 
 	}
 	defer func() { _ = nested.Rollback(ctx) }()
 
-	if err := fn(nested); err != nil {
+	txCtx := context.WithValue(ctx, txKey{}, nested)
+	if err := fn(txCtx, nested); err != nil {
 		return err
 	}
 	if err := nested.Commit(ctx); err != nil {
