@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -21,10 +22,23 @@ import (
 
 // Snapshot is a point-in-time representation of a PostgreSQL schema.
 type Snapshot struct {
-	CapturedAt time.Time           `json:"captured_at"`
-	Tables     map[string]*Table   `json:"tables"`
-	Enums      map[string][]string `json:"enums,omitempty"`
-	Sequences  []string            `json:"sequences,omitempty"`
+	SnapshotVersion int                 `json:"snapshot_version"`
+	CapturedAt      time.Time           `json:"captured_at"`
+	Tables          map[string]*Table   `json:"tables"`
+	Enums           map[string][]string `json:"enums,omitempty"`
+	Sequences       []Sequence          `json:"sequences,omitempty"`
+}
+
+// Sequence is the stable PostgreSQL sequence configuration captured in a snapshot.
+type Sequence struct {
+	Name      string `json:"name"`
+	DataType  string `json:"data_type"`
+	Start     string `json:"start"`
+	MinValue  string `json:"min_value"`
+	MaxValue  string `json:"max_value"`
+	Increment string `json:"increment"`
+	Cycle     bool   `json:"cycle"`
+	Cache     string `json:"cache"`
 }
 
 // Table describes a single PostgreSQL table.
@@ -70,8 +84,9 @@ func ignoreTable(name string) bool {
 // and returns a Snapshot. It does not execute any DDL or DML.
 func Capture(ctx context.Context, pool *pgxpool.Pool) (*Snapshot, error) {
 	snap := &Snapshot{
-		CapturedAt: time.Now().UTC(),
-		Tables:     make(map[string]*Table),
+		SnapshotVersion: 2,
+		CapturedAt:      time.Now().UTC(),
+		Tables:          make(map[string]*Table),
 	}
 
 	if err := captureColumns(ctx, pool, snap); err != nil {
@@ -275,23 +290,22 @@ func captureEnums(ctx context.Context, pool *pgxpool.Pool, snap *Snapshot) error
 
 func captureSequences(ctx context.Context, pool *pgxpool.Pool, snap *Snapshot) error {
 	rows, err := pool.Query(ctx, `
-		SELECT sequence_name
-		FROM information_schema.sequences
-		WHERE sequence_schema = 'public'
-		ORDER BY sequence_name
+		SELECT c.relname, format_type(s.seqtypid, NULL), s.seqstart::text, s.seqmin::text, s.seqmax::text, s.seqincrement::text, s.seqcycle, s.seqcache::text
+		FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public' ORDER BY c.relname
 	`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 
-	var seqs []string
+	var seqs []Sequence
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var sequence Sequence
+		if err := rows.Scan(&sequence.Name, &sequence.DataType, &sequence.Start, &sequence.MinValue, &sequence.MaxValue, &sequence.Increment, &sequence.Cycle, &sequence.Cache); err != nil {
 			return err
 		}
-		seqs = append(seqs, name)
+		seqs = append(seqs, sequence)
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -307,11 +321,33 @@ func (s *Snapshot) MarshalToJSON() ([]byte, error) {
 
 // UnmarshalSnapshot parses a JSON-encoded Snapshot.
 func UnmarshalSnapshot(data []byte) (*Snapshot, error) {
-	var s Snapshot
-	if err := json.Unmarshal(data, &s); err != nil {
+	var raw struct {
+		SnapshotVersion int                 `json:"snapshot_version"`
+		CapturedAt      time.Time           `json:"captured_at"`
+		Tables          map[string]*Table   `json:"tables"`
+		Enums           map[string][]string `json:"enums"`
+		Sequences       json.RawMessage     `json:"sequences"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("schema: unmarshal snapshot: %w", err)
 	}
-	return &s, nil
+	s := &Snapshot{SnapshotVersion: raw.SnapshotVersion, CapturedAt: raw.CapturedAt, Tables: raw.Tables, Enums: raw.Enums}
+	if s.SnapshotVersion == 0 {
+		s.SnapshotVersion = 1
+	}
+	if len(raw.Sequences) > 0 && string(raw.Sequences) != "null" {
+		if err := json.Unmarshal(raw.Sequences, &s.Sequences); err != nil {
+			s.Sequences = nil
+			var names []string
+			if legacyErr := json.Unmarshal(raw.Sequences, &names); legacyErr != nil {
+				return nil, fmt.Errorf("schema: unmarshal sequences: %w", err)
+			}
+			for _, name := range names {
+				s.Sequences = append(s.Sequences, Sequence{Name: name})
+			}
+		}
+	}
+	return s, nil
 }
 
 // DriftKind classifies a drift entry.
@@ -331,6 +367,7 @@ const (
 	DriftConstraintChanged DriftKind = "constraint_changed"
 	DriftSequenceAdded     DriftKind = "sequence_added"
 	DriftSequenceRemoved   DriftKind = "sequence_removed"
+	DriftSequenceChanged   DriftKind = "sequence_changed"
 	DriftEnumChanged       DriftKind = "enum_changed"
 )
 
@@ -495,24 +532,26 @@ func diffConstraints(tableName string, base, live *Table) []DriftEntry {
 	return entries
 }
 
-func diffSequences(base, live []string) []DriftEntry {
+func diffSequences(base, live []Sequence) []DriftEntry {
 	var entries []DriftEntry
-	baseMap := make(map[string]bool)
+	baseMap := make(map[string]Sequence)
 	for _, s := range base {
-		baseMap[s] = true
+		baseMap[s.Name] = s
 	}
-	liveMap := make(map[string]bool)
+	liveMap := make(map[string]Sequence)
 	for _, s := range live {
-		liveMap[s] = true
+		liveMap[s.Name] = s
 	}
-	for s := range liveMap {
-		if !baseMap[s] {
-			entries = append(entries, DriftEntry{Kind: DriftSequenceAdded, Object: s})
+	for name, sequence := range liveMap {
+		if _, ok := baseMap[name]; !ok {
+			entries = append(entries, DriftEntry{Kind: DriftSequenceAdded, Object: name})
+		} else if !reflect.DeepEqual(baseMap[name], sequence) {
+			entries = append(entries, DriftEntry{Kind: DriftSequenceChanged, Object: name, Detail: fmt.Sprintf("base=%+v live=%+v", baseMap[name], sequence)})
 		}
 	}
-	for s := range baseMap {
-		if !liveMap[s] {
-			entries = append(entries, DriftEntry{Kind: DriftSequenceRemoved, Object: s})
+	for name := range baseMap {
+		if _, ok := liveMap[name]; !ok {
+			entries = append(entries, DriftEntry{Kind: DriftSequenceRemoved, Object: name})
 		}
 	}
 	return entries

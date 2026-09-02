@@ -136,8 +136,9 @@ func TestSnapshotJSONRoundtrip(t *testing.T) {
 				},
 			},
 		},
-		Enums:     map[string][]string{"status": {"active", "inactive"}},
-		Sequences: []string{"products_id_seq"},
+		Enums:           map[string][]string{"status": {"active", "inactive"}},
+		SnapshotVersion: 2,
+		Sequences:       []Sequence{{Name: "products_id_seq", DataType: "bigint", Start: "1", MinValue: "1", MaxValue: "9223372036854775807", Increment: "1", Cache: "1"}},
 	}
 	data, err := snap.MarshalToJSON()
 	if err != nil {
@@ -152,5 +153,24 @@ func TestSnapshotJSONRoundtrip(t *testing.T) {
 	}
 	if len(got.Enums["status"]) != 2 {
 		t.Fatalf("expected 2 enum values, got %d", len(got.Enums["status"]))
+	}
+}
+
+func TestDiffSequenceChanged(t *testing.T) {
+	base := &Snapshot{Tables: map[string]*Table{}, Sequences: []Sequence{{Name: "ids", Increment: "1", Cache: "1"}}}
+	live := &Snapshot{Tables: map[string]*Table{}, Sequences: []Sequence{{Name: "ids", Increment: "2", Cache: "10"}}}
+	result := Diff(base, live)
+	if len(result.Entries) != 1 || result.Entries[0].Kind != DriftSequenceChanged {
+		t.Fatalf("unexpected drift: %+v", result.Entries)
+	}
+}
+
+func TestUnmarshalLegacySequenceSnapshot(t *testing.T) {
+	s, err := UnmarshalSnapshot([]byte(`{"tables":{},"sequences":["ids"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.SnapshotVersion != 1 || len(s.Sequences) != 1 || s.Sequences[0].Name != "ids" {
+		t.Fatalf("legacy snapshot: %+v", s)
 	}
 }
