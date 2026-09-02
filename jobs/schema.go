@@ -1,7 +1,7 @@
 package jobs
 
-// Schema is the SQL used to create the jobs table. Consumers may embed and
-// apply it via devengine/migrate.
+// Schema bootstraps the jobs table for ephemeral tests only. Production
+// deployments must apply migrate.EngineSources() for upgrade-safe evolution.
 const Schema = `
 CREATE TABLE IF NOT EXISTS devengine_jobs (
 	id TEXT PRIMARY KEY,

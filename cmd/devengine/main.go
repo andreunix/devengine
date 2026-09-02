@@ -157,7 +157,7 @@ func baseFiles(module, appName, profile string) []scaffoldFile {
 		},
 		{
 			path:    "db/migrations/1000_initial.up.sql",
-			content: "-- Application migrations start at version 1000.\n-- Add your schema changes here.\n",
+			content: "-- Engine migrations (1-999) run first via migrate.EngineSources().\n-- Application migrations start at version 1000.\n-- Add your schema changes here.\n",
 		},
 		{
 			path:    "internal/app/app.go",
@@ -405,7 +405,7 @@ fmt:
 	gofmt -w .
 
 migrate:
-	@echo "Run your migrate command here"
+	@echo "Apply migrate.EngineSources() first, then db/migrations (1000+), before starting the runtime."
 `
 	switch profile {
 	case "worker":

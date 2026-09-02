@@ -91,7 +91,12 @@ ready.AddInformational("cache", cache.ReadyCheck)
 
 ## Banco, migrations e schema
 
-Migrations da engine usam versões `1–999`; a aplicação usa `1000+`. Para integration tests:
+Migrations da engine usam versões `1–999`; a aplicação usa `1000+`. Todo deploy deve executar primeiro as fontes da engine e depois as fontes da aplicação — `Schema` de jobs/outbox serve apenas para bootstrap efêmero/testes, não para upgrades.
+
+```go
+sources := append(migrate.EngineSources(), migrate.Source{Kind: migrate.AppSource, FS: appMigrations})
+err := (migrate.Runner{Pool: db.Pool(), Sources: sources}).Apply(ctx)
+```
 
 ```bash
 export TEST_DATABASE_URL='postgres://localhost:5432/postgres?sslmode=disable'

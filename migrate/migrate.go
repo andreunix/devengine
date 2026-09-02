@@ -5,6 +5,7 @@ package migrate
 import (
 	"context"
 	"crypto/sha256"
+	"embed"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -20,6 +21,17 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// engineMigrations contains the versioned schema owned by devengine.
+//
+//go:embed migrations/*.up.sql
+var engineMigrations embed.FS
+
+// EngineSources returns the official migrations for devengine-owned tables.
+// Pass these before application sources to Runner.
+func EngineSources() []Source {
+	return []Source{{Kind: EngineSource, FS: engineMigrations, Dir: "migrations"}}
+}
 
 const (
 	EngineMinVersion           = 1

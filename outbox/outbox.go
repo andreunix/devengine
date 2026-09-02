@@ -41,8 +41,8 @@ const (
 	defaultMaxAttempts  = 5
 )
 
-// Schema is the SQL used to create the outbox table. Consumers may embed and
-// apply it via devengine/migrate.
+// Schema bootstraps the outbox table for ephemeral tests only. Production
+// deployments must apply migrate.EngineSources() for upgrade-safe evolution.
 const Schema = `CREATE TABLE IF NOT EXISTS outbox_messages (
 	id            TEXT        PRIMARY KEY,
 	event_type    TEXT        NOT NULL,
