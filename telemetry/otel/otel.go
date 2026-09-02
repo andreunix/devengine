@@ -38,7 +38,30 @@ func (s span) RecordError(e error) {
 	}
 }
 func (s span) SetAttribute(k string, v any) {
-	s.inner.SetAttributes(attribute.String(k, fmt.Sprint(v)))
+	s.inner.SetAttributes(attributeFor(k, v))
+}
+
+func attributeFor(key string, value any) attribute.KeyValue {
+	switch value := value.(type) {
+	case string:
+		return attribute.String(key, value)
+	case bool:
+		return attribute.Bool(key, value)
+	case int:
+		return attribute.Int(key, value)
+	case int32:
+		return attribute.Int64(key, int64(value))
+	case int64:
+		return attribute.Int64(key, value)
+	case float32:
+		return attribute.Float64(key, float64(value))
+	case float64:
+		return attribute.Float64(key, value)
+	case []string:
+		return attribute.StringSlice(key, value)
+	default:
+		return attribute.String(key, fmt.Sprint(value))
+	}
 }
 
 type meterAdapter struct{ inner metric.Meter }

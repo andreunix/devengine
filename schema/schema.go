@@ -419,7 +419,10 @@ func compare(base, live *Snapshot) DriftResult {
 		entries = append(entries, diffConstraints(name, base.Tables[name], live.Tables[name])...)
 	}
 	// Sequences.
-	entries = append(entries, diffSequences(base.Sequences, live.Sequences)...)
+	// Version 1 stored sequences as names only. Comparing the zero-value v2
+	// fields structurally would report every retained sequence as changed.
+	// Keep detecting additions/removals, but compare v1 sequences by name.
+	entries = append(entries, diffSequences(base.Sequences, live.Sequences, base.SnapshotVersion >= 2)...)
 	// Enums.
 	entries = append(entries, diffEnums(base.Enums, live.Enums)...)
 
@@ -532,7 +535,7 @@ func diffConstraints(tableName string, base, live *Table) []DriftEntry {
 	return entries
 }
 
-func diffSequences(base, live []Sequence) []DriftEntry {
+func diffSequences(base, live []Sequence, compareConfiguration bool) []DriftEntry {
 	var entries []DriftEntry
 	baseMap := make(map[string]Sequence)
 	for _, s := range base {
@@ -545,7 +548,7 @@ func diffSequences(base, live []Sequence) []DriftEntry {
 	for name, sequence := range liveMap {
 		if _, ok := baseMap[name]; !ok {
 			entries = append(entries, DriftEntry{Kind: DriftSequenceAdded, Object: name})
-		} else if !reflect.DeepEqual(baseMap[name], sequence) {
+		} else if compareConfiguration && !reflect.DeepEqual(baseMap[name], sequence) {
 			entries = append(entries, DriftEntry{Kind: DriftSequenceChanged, Object: name, Detail: fmt.Sprintf("base=%+v live=%+v", baseMap[name], sequence)})
 		}
 	}

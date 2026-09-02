@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"sync"
 	"time"
 
 	"github.com/andreunix/devengine/id"
@@ -21,6 +22,10 @@ type WorkerConfig struct {
 	InitialBackoff time.Duration
 	// LeaseDuration is the maximum time a worker owns a claimed job.
 	LeaseDuration time.Duration
+	// LeaseRenewalInterval controls how often an active handler renews its
+	// lease. Zero renews at half LeaseDuration. Values at or above the lease
+	// duration are clamped to half the lease to prevent expiry before renewal.
+	LeaseRenewalInterval time.Duration
 }
 
 func (c *WorkerConfig) batchSize() int {
@@ -48,10 +53,23 @@ func (c *WorkerConfig) leaseDuration() time.Duration {
 	return 5 * time.Minute
 }
 
+func (c *WorkerConfig) leaseRenewalInterval() time.Duration {
+	lease := c.leaseDuration()
+	if c.LeaseRenewalInterval > 0 && c.LeaseRenewalInterval < lease {
+		return c.LeaseRenewalInterval
+	}
+	interval := lease / 2
+	if interval <= 0 {
+		return time.Nanosecond
+	}
+	return interval
+}
+
 // Worker is a background worker that polls the jobs table. Jobs use leased
-// claims: after LeaseDuration another worker may retry delivery, but only the
-// holder of the current claim token can persist its outcome. Handlers must be
-// idempotent because delivery remains at-least-once.
+// claims: active handlers renew their lease, and only the holder of the
+// current claim token can renew or persist an outcome. Handlers must remain
+// idempotent because delivery remains at-least-once (for example after a
+// process crash or a lost lease).
 type Worker struct {
 	Pool     *pgxpool.Pool
 	Registry *Registry
@@ -127,7 +145,7 @@ func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
 			FOR UPDATE SKIP LOCKED
 		)
 		RETURNING id, name, payload, attempt, max_attempts, claim_token
-	`), batch, fmt.Sprintf("%d seconds", int(leaseDuration.Seconds())), claimPrefix)
+	`), batch, postgresInterval(leaseDuration), claimPrefix)
 	if err != nil {
 		return fmt.Errorf("jobs: claim batch: %w", err)
 	}
@@ -147,7 +165,8 @@ func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
 	}
 
 	for _, j := range jobs {
-		jobCtx, jobSpan := w.Tracer.Start(ctx, "jobs.deliver")
+		handlerCtx, stopRenewal := w.startLeaseRenewal(ctx, logger, j, leaseDuration)
+		jobCtx, jobSpan := w.Tracer.Start(handlerCtx, "jobs.deliver")
 		jobSpan.SetAttribute("job.id", j.id)
 		jobSpan.SetAttribute("job.name", j.name)
 
@@ -158,6 +177,7 @@ func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
 		} else {
 			processErr = handler.Handle(jobCtx, j.payload)
 		}
+		stopRenewal()
 
 		if processErr != nil {
 			jobSpan.RecordError(processErr)
@@ -213,6 +233,54 @@ func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
 	}
 
 	return nil
+}
+
+func (w *Worker) startLeaseRenewal(parent context.Context, logger *slog.Logger, job jobRow, lease time.Duration) (context.Context, func()) {
+	handlerCtx, cancelHandler := context.WithCancel(parent)
+	renewalCtx, cancelRenewal := context.WithCancel(parent)
+	done := make(chan struct{})
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			cancelRenewal()
+			<-done
+			cancelHandler()
+		})
+	}
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(w.Config.leaseRenewalInterval())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-renewalCtx.Done():
+				return
+			case <-ticker.C:
+				tag, err := w.Pool.Exec(renewalCtx, `
+					UPDATE devengine_jobs
+					SET locked_until = NOW() + $3::interval
+					WHERE id = $1 AND claim_token = $2 AND locked_until > NOW()
+				`, job.id, job.claimToken, postgresInterval(lease))
+				if err != nil {
+					if !errors.Is(err, context.Canceled) {
+						logger.Warn("jobs: lease renewal failed", "id", job.id, "error", err)
+					}
+					continue
+				}
+				if tag.RowsAffected() != 1 {
+					logger.Warn("jobs: lease ownership lost", "id", job.id, "name", job.name)
+					cancelHandler()
+					return
+				}
+			}
+		}
+	}()
+	return handlerCtx, stop
+}
+
+func postgresInterval(duration time.Duration) string {
+	return fmt.Sprintf("%.9f seconds", duration.Seconds())
 }
 
 func (w *Worker) backoff(attempt int) time.Duration {

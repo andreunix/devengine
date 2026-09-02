@@ -70,7 +70,7 @@ err := db.WithTransaction(ctx, func(txCtx context.Context, tx pgx.Tx) error {
 })
 ```
 
-`outbox.Enqueue` e `jobs.Enqueue` devem ser chamados nessa transação. Entrega é at-least-once: handlers precisam ser idempotentes; tokens de lease impedem que um worker stale grave o outcome de um owner novo.
+`outbox.Enqueue` e `jobs.Enqueue` devem ser chamados nessa transação. Entrega é at-least-once: handlers precisam ser idempotentes; tokens de lease impedem que um worker stale grave o outcome de um owner novo. Durante handlers ativos, Jobs e Outbox renovam o lease com o respectivo token; `LeaseRenewalInterval` é metade do lease por padrão e pode ser ajustado. Se ownership for perdido, renovações param e o contexto do handler é cancelado.
 No outbox, `outbox_messages.max_attempts` é a autoridade por mensagem para retries.
 
 ```go
@@ -104,7 +104,7 @@ export TEST_DATABASE_URL='postgres://localhost:5432/postgres?sslmode=disable'
 go test -race -count=1 ./...
 ```
 
-`schema.Capture` produz snapshots `snapshot_version: 2`; `schema.Diff` reporta drift de tabelas, enums e sequences, incluindo configuração de sequence. Snapshots v1 continuam legíveis; como o módulo está em `< v1`, mudanças incompatíveis seguem SemVer pré-1.0.
+`schema.Capture` produz snapshots `snapshot_version: 2`; `schema.Diff` reporta drift de tabelas, enums e sequences, incluindo configuração de sequence. Snapshots v1 continuam legíveis e, para sequences, são comparados apenas por nome: adições e remoções são detectadas, mas metadata que não existia no formato v1 não gera falso `sequence_changed`.
 
 ## Telemetria
 
@@ -114,6 +114,19 @@ Telemetry é noop por padrão. A aplicação configura providers/exporters/propa
 adapter := devotel.New(tracerProvider, meterProvider)
 app := engine.New(engine.WithTelemetry(adapter.Tracer(), adapter.Meter()))
 ```
+
+Para propagar W3C Trace Context no HTTP, passe explicitamente o propagador da aplicação. Sem essa opção o middleware não lê nem escreve `traceparent`/`tracestate`.
+
+```go
+handler := middleware.Telemetry(adapter.Tracer(), adapter.Meter(),
+  middleware.WithPropagator(propagation.TraceContext{}),
+)(appHandler)
+
+// Em chamadas de saída (ou para expor o contexto na resposta):
+middleware.InjectTraceContext(ctx, request.Header, propagation.TraceContext{})
+```
+
+`jobs` é uma fila persistente de jobs atrasáveis, com retry; não é um scheduler cron ou de recorrência.
 
 ## Módulo privado
 

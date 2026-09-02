@@ -144,6 +144,13 @@ func TestSnapshotJSONRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	again, err := snap.MarshalToJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(again) {
+		t.Fatalf("snapshot JSON is not deterministic:\n%s\n!=\n%s", data, again)
+	}
 	got, err := UnmarshalSnapshot(data)
 	if err != nil {
 		t.Fatal(err)
@@ -157,11 +164,49 @@ func TestSnapshotJSONRoundtrip(t *testing.T) {
 }
 
 func TestDiffSequenceChanged(t *testing.T) {
-	base := &Snapshot{Tables: map[string]*Table{}, Sequences: []Sequence{{Name: "ids", Increment: "1", Cache: "1"}}}
-	live := &Snapshot{Tables: map[string]*Table{}, Sequences: []Sequence{{Name: "ids", Increment: "2", Cache: "10"}}}
+	base := Sequence{Name: "ids", Increment: "1", Cache: "1"}
+	for _, test := range []struct {
+		name string
+		live Sequence
+	}{
+		{name: "increment", live: Sequence{Name: "ids", Increment: "2", Cache: "1"}},
+		{name: "cache", live: Sequence{Name: "ids", Increment: "1", Cache: "10"}},
+		{name: "cycle", live: Sequence{Name: "ids", Increment: "1", Cache: "1", Cycle: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			baseline := &Snapshot{SnapshotVersion: 2, Tables: map[string]*Table{}, Sequences: []Sequence{base}}
+			live := &Snapshot{SnapshotVersion: 2, Tables: map[string]*Table{}, Sequences: []Sequence{test.live}}
+			result := Diff(baseline, live)
+			if len(result.Entries) != 1 || result.Entries[0].Kind != DriftSequenceChanged {
+				t.Fatalf("unexpected drift: %+v", result.Entries)
+			}
+		})
+	}
+}
+
+func TestDiffLegacySequencesCompareByName(t *testing.T) {
+	base := &Snapshot{SnapshotVersion: 1, Tables: map[string]*Table{}, Sequences: []Sequence{{Name: "ids"}}}
+	live := &Snapshot{SnapshotVersion: 2, Tables: map[string]*Table{}, Sequences: []Sequence{{Name: "ids", Increment: "2", Cache: "10"}}}
+	if result := Diff(base, live); result.HasDrift {
+		t.Fatalf("legacy sequence metadata must not drift: %+v", result.Entries)
+	}
+}
+
+func TestDiffLegacySequencesDetectAddition(t *testing.T) {
+	base := &Snapshot{SnapshotVersion: 1, Tables: map[string]*Table{}}
+	live := &Snapshot{SnapshotVersion: 2, Tables: map[string]*Table{}, Sequences: []Sequence{{Name: "added"}}}
 	result := Diff(base, live)
-	if len(result.Entries) != 1 || result.Entries[0].Kind != DriftSequenceChanged {
-		t.Fatalf("unexpected drift: %+v", result.Entries)
+	if !result.HasDrift || len(result.Entries) != 1 || result.Entries[0].Kind != DriftSequenceAdded {
+		t.Fatalf("expected sequence addition, got %+v", result.Entries)
+	}
+}
+
+func TestDiffLegacySequencesDetectRemoval(t *testing.T) {
+	base := &Snapshot{SnapshotVersion: 1, Tables: map[string]*Table{}, Sequences: []Sequence{{Name: "removed"}}}
+	live := &Snapshot{SnapshotVersion: 2, Tables: map[string]*Table{}}
+	result := Diff(base, live)
+	if !result.HasDrift || len(result.Entries) != 1 || result.Entries[0].Kind != DriftSequenceRemoved {
+		t.Fatalf("expected sequence removal, got %+v", result.Entries)
 	}
 }
 

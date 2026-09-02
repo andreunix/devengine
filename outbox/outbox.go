@@ -14,7 +14,8 @@
 //   - Lease ownership: every claim has a token and only its owner may record an
 //     outcome. After lease expiry, delivery can happen again (at-least-once),
 //     so handlers must remain idempotent; a stale worker cannot overwrite the
-//     newer owner's outcome.
+//     newer owner's outcome. Active handlers renew their lease; a lost lease
+//     cancels the handler context and stops further renewals.
 //   - Atomic enqueue: Enqueue must be called within the domain transaction.
 package outbox
 
@@ -25,6 +26,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"sync"
 	"time"
 
 	"github.com/andreunix/devengine/events"
@@ -74,6 +76,10 @@ type RelayConfig struct {
 	InitialBackoff time.Duration
 	// LeaseDuration is the maximum time a relay owns a claimed message.
 	LeaseDuration time.Duration
+	// LeaseRenewalInterval controls how often an active handler renews its
+	// lease. Zero renews at half LeaseDuration. Values at or above the lease
+	// duration are clamped to half the lease to prevent expiry before renewal.
+	LeaseRenewalInterval time.Duration
 }
 
 func (c *RelayConfig) table() string {
@@ -108,6 +114,18 @@ func (c *RelayConfig) leaseDuration() time.Duration {
 		return c.LeaseDuration
 	}
 	return 5 * time.Minute
+}
+
+func (c *RelayConfig) leaseRenewalInterval() time.Duration {
+	lease := c.leaseDuration()
+	if c.LeaseRenewalInterval > 0 && c.LeaseRenewalInterval < lease {
+		return c.LeaseRenewalInterval
+	}
+	interval := lease / 2
+	if interval <= 0 {
+		return time.Nanosecond
+	}
+	return interval
 }
 
 // Enqueue writes event into the outbox table within tx. It must be called
@@ -217,12 +235,13 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 			WHERE processed_at IS NULL
 			  AND failed_at IS NULL
 			  AND process_after <= NOW()
+			  AND (locked_until IS NULL OR locked_until <= NOW())
 			ORDER BY occurred_at
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		)
 		RETURNING id, event_type, aggregate_id, aggregate_type, payload, schema_version, occurred_at, attempt, max_attempts, claim_token
-	`, table, table), batch, fmt.Sprintf("%d seconds", int(leaseDuration.Seconds())), claimPrefix)
+	`, table, table), batch, postgresInterval(leaseDuration), claimPrefix)
 	if err != nil {
 		return fmt.Errorf("outbox: claim batch: %w", err)
 	}
@@ -253,11 +272,13 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 			OccurredAt:    m.occurredAt,
 		}
 
-		evCtx, evSpan := r.Tracer.Start(ctx, "outbox.deliver")
+		handlerCtx, stopRenewal := r.startLeaseRenewal(ctx, logger, table, m, leaseDuration)
+		evCtx, evSpan := r.Tracer.Start(handlerCtx, "outbox.deliver")
 		evSpan.SetAttribute("event.id", m.id)
 		evSpan.SetAttribute("event.type", m.eventType)
 
 		deliveryErr := r.deliver(evCtx, event)
+		stopRenewal()
 		if deliveryErr != nil {
 			evSpan.RecordError(deliveryErr)
 		}
@@ -314,6 +335,55 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 	}
 
 	return nil
+}
+
+func (r *Relay) startLeaseRenewal(parent context.Context, logger *slog.Logger, table string, message outboxRow, lease time.Duration) (context.Context, func()) {
+	handlerCtx, cancelHandler := context.WithCancel(parent)
+	renewalCtx, cancelRenewal := context.WithCancel(parent)
+	done := make(chan struct{})
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			cancelRenewal()
+			<-done
+			cancelHandler()
+		})
+	}
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(r.Config.leaseRenewalInterval())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-renewalCtx.Done():
+				return
+			case <-ticker.C:
+				tag, err := r.Pool.Exec(renewalCtx, fmt.Sprintf(`
+					UPDATE %s
+					SET process_after = NOW() + $3::interval,
+					    locked_until = NOW() + $3::interval
+					WHERE id = $1 AND claim_token = $2 AND locked_until > NOW()
+				`, table), message.id, message.claimToken, postgresInterval(lease))
+				if err != nil {
+					if !errors.Is(err, context.Canceled) {
+						logger.Warn("outbox: lease renewal failed", "id", message.id, "error", err)
+					}
+					continue
+				}
+				if tag.RowsAffected() != 1 {
+					logger.Warn("outbox: lease ownership lost", "id", message.id, "type", message.eventType)
+					cancelHandler()
+					return
+				}
+			}
+		}
+	}()
+	return handlerCtx, stop
+}
+
+func postgresInterval(duration time.Duration) string {
+	return fmt.Sprintf("%.9f seconds", duration.Seconds())
 }
 
 func (r *Relay) deliver(ctx context.Context, event events.Event) error {
