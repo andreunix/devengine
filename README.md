@@ -42,7 +42,7 @@ go run ./cmd/app
 
 ## Profiles e lifecycle
 
-`devengine new -profile http`, `devengine new -profile worker` e `devengine new -profile combined` geram, respectivamente, HTTP, worker e ambos em `cmd/app`. O engine inicia módulos e workers registrados e encerra-os por contexto/sinal.
+`devengine new -profile http`, `devengine new -profile worker` e `devengine new -profile combined` geram, respectivamente, HTTP, worker e ambos. O profile `http` usa `cmd/server`; `worker` e `combined` usam `cmd/app`. O engine inicia módulos e workers registrados e encerra-os por contexto/sinal.
 
 ```go
 // HTTP-only: engine.New(engine.WithProfile(engine.ProfileHTTP))
@@ -50,16 +50,44 @@ go run ./cmd/app
 // Combined (padrão): engine.New()
 ```
 
+```bash
+devengine new -module github.com/acme/api -profile http
+cd api && go run ./cmd/server
+
+devengine new -module github.com/acme/worker -profile worker
+cd worker && go run ./cmd/app
+
+devengine new -module github.com/acme/service -profile combined
+cd service && go run ./cmd/app
+```
+
 Use a fronteira transacional com o contexto retornado, para que todos os repositórios compartilhem a mesma transação:
 
 ```go
-err := db.WithTransaction(ctx, func(txCtx context.Context, _ pgx.Tx) error {
+err := db.WithTransaction(ctx, func(txCtx context.Context, tx pgx.Tx) error {
   _, err := db.Querier(txCtx).Exec(txCtx, `INSERT INTO users (email) VALUES ($1)`, email)
   return err
 })
 ```
 
 `outbox.Enqueue` e `jobs.Enqueue` devem ser chamados nessa transação. Entrega é at-least-once: handlers precisam ser idempotentes; tokens de lease impedem que um worker stale grave o outcome de um owner novo.
+
+```go
+// Dentro de db.WithTransaction: evento e alteração de domínio são atômicos.
+err := outbox.Enqueue(txCtx, tx, events.Event{ID: "evt_1", Type: "UserCreated", OccurredAt: time.Now()}, "")
+err = jobs.Enqueue(txCtx, tx, jobs.Job{Name: "send_email", Payload: map[string]string{"to": email}})
+
+// Workers usam pools e registries fornecidos pela aplicação.
+relay := &outbox.Relay{Pool: db.Pool(), Registry: eventRegistry}
+worker := &jobs.Worker{Pool: db.Pool(), Registry: jobRegistry}
+```
+
+```go
+// Readiness crítica bloqueia /readyz; checks informativos apenas aparecem no diagnóstico.
+ready := health.NewRegistry()
+ready.Add("postgres", db.ReadyCheck())
+ready.AddInformational("cache", cache.ReadyCheck)
+```
 
 ## Banco, migrations e schema
 
