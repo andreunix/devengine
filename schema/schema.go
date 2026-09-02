@@ -21,10 +21,10 @@ import (
 
 // Snapshot is a point-in-time representation of a PostgreSQL schema.
 type Snapshot struct {
-	CapturedAt time.Time          `json:"captured_at"`
-	Tables     map[string]*Table  `json:"tables"`
+	CapturedAt time.Time           `json:"captured_at"`
+	Tables     map[string]*Table   `json:"tables"`
 	Enums      map[string][]string `json:"enums,omitempty"`
-	Sequences  []string           `json:"sequences,omitempty"`
+	Sequences  []string            `json:"sequences,omitempty"`
 }
 
 // Table describes a single PostgreSQL table.
@@ -46,11 +46,11 @@ type Column struct {
 
 // Index describes a table index.
 type Index struct {
-	Name     string `json:"name"`
-	Unique   bool   `json:"unique"`
-	Primary  bool   `json:"primary"`
-	Columns  []string `json:"columns"`
-	Definition string `json:"definition"`
+	Name       string   `json:"name"`
+	Unique     bool     `json:"unique"`
+	Primary    bool     `json:"primary"`
+	Columns    []string `json:"columns"`
+	Definition string   `json:"definition"`
 }
 
 // Constraint describes a table constraint (PK, FK, unique, check).
@@ -361,10 +361,10 @@ const (
 
 // DriftEntry describes a single schema difference.
 type DriftEntry struct {
-	Kind    DriftKind `json:"kind"`
-	Table   string    `json:"table,omitempty"`
-	Object  string    `json:"object,omitempty"`
-	Detail  string    `json:"detail,omitempty"`
+	Kind   DriftKind `json:"kind"`
+	Table  string    `json:"table,omitempty"`
+	Object string    `json:"object,omitempty"`
+	Detail string    `json:"detail,omitempty"`
 }
 
 // DriftResult is the output of Diff or Report.

@@ -21,11 +21,11 @@ import (
 )
 
 const (
-	EngineMinVersion        = 1
-	EngineMaxVersion        = 999
-	AppMinVersion           = 1000
-	defaultMetadataTable    = "_devengine_migrations"
-	migrationLockID   int64 = 0x64657665656e67 // "deveeng"
+	EngineMinVersion           = 1
+	EngineMaxVersion           = 999
+	AppMinVersion              = 1000
+	defaultMetadataTable       = "_devengine_migrations"
+	migrationLockID      int64 = 0x64657665656e67 // "deveeng"
 )
 
 var migrationPattern = regexp.MustCompile(`^(\d+)_([a-zA-Z0-9_-]+)\.up\.sql$`)

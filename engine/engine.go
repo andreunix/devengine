@@ -266,7 +266,6 @@ func (e *Engine) Run(ctx context.Context) error {
 	return runErr
 }
 
-
 func (e *Engine) installInfrastructureRoutes() {
 	e.mux.HandleFunc("GET /healthz", health.LiveHandler(e.name))
 	e.mux.Handle("GET /readyz", e.readiness.Handler(e.name))
