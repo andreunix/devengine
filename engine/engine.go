@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/andreunix/devengine/health"
+	"github.com/andreunix/devengine/telemetry"
 )
 
 type serverTimeouts struct {
@@ -62,6 +63,9 @@ type Engine struct {
 	shutdownTimeout time.Duration
 	serverTimeouts  serverTimeouts
 
+	tracer telemetry.Tracer
+	meter  telemetry.Meter
+
 	mu          sync.Mutex
 	registered  map[string]struct{}
 	workerNames map[string]struct{}
@@ -82,6 +86,8 @@ func New(options ...Option) *Engine {
 			write:      30 * time.Second,
 			idle:       60 * time.Second,
 		},
+		tracer:      telemetry.NoopTracer,
+		meter:       telemetry.NoopMeter,
 		registered:  make(map[string]struct{}),
 		workerNames: make(map[string]struct{}),
 	}
@@ -95,6 +101,8 @@ func (e *Engine) Name() string                { return e.name }
 func (e *Engine) Logger() *slog.Logger        { return e.logger }
 func (e *Engine) Router() *http.ServeMux      { return e.mux }
 func (e *Engine) Readiness() *health.Registry { return e.readiness }
+func (e *Engine) Tracer() telemetry.Tracer    { return e.tracer }
+func (e *Engine) Meter() telemetry.Meter      { return e.meter }
 
 func (e *Engine) Handle(pattern string, handler http.Handler) {
 	e.mux.Handle(pattern, handler)

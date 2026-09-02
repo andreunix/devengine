@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/andreunix/devengine/telemetry"
 )
 
 type Option func(*Engine)
@@ -66,5 +68,17 @@ func WithServerTimeouts(readHeader, read, write, idle time.Duration) Option {
 func WithMiddleware(middleware ...func(http.Handler) http.Handler) Option {
 	return func(e *Engine) {
 		e.middleware = append(e.middleware, middleware...)
+	}
+}
+
+// WithTelemetry configures the Engine to use the provided Tracer and Meter.
+func WithTelemetry(tracer telemetry.Tracer, meter telemetry.Meter) Option {
+	return func(e *Engine) {
+		if tracer != nil {
+			e.tracer = tracer
+		}
+		if meter != nil {
+			e.meter = meter
+		}
 	}
 }

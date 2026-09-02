@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/andreunix/devengine/events"
+	"github.com/andreunix/devengine/telemetry"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -139,6 +140,8 @@ type Relay struct {
 	Registry *events.Registry
 	Logger   *slog.Logger
 	Config   RelayConfig
+	Tracer   telemetry.Tracer
+	Meter    telemetry.Meter
 }
 
 // Name implements engine.Worker.
@@ -149,6 +152,12 @@ func (r *Relay) Run(ctx context.Context) error {
 	logger := r.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if r.Tracer == nil {
+		r.Tracer = telemetry.NoopTracer
+	}
+	if r.Meter == nil {
+		r.Meter = telemetry.NoopMeter
 	}
 	ticker := time.NewTicker(r.Config.pollInterval())
 	defer ticker.Stop()
@@ -177,6 +186,9 @@ type outboxRow struct {
 }
 
 func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
+	ctx, span := r.Tracer.Start(ctx, "outbox.processBatch")
+	defer span.End()
+
 	table := r.Config.table()
 	batch := r.Config.batchSize()
 	maxAttempts := r.Config.maxAttempts()
@@ -228,7 +240,16 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 			OccurredAt:    m.occurredAt,
 		}
 
-		deliveryErr := r.deliver(ctx, event)
+		evCtx, evSpan := r.Tracer.Start(ctx, "outbox.deliver")
+		evSpan.SetAttribute("event.id", m.id)
+		evSpan.SetAttribute("event.type", m.eventType)
+
+		deliveryErr := r.deliver(evCtx, event)
+		if deliveryErr != nil {
+			evSpan.RecordError(deliveryErr)
+		}
+		evSpan.End()
+
 		nextAttempt := m.attempt + 1
 
 		if deliveryErr == nil {
@@ -259,6 +280,19 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 		}
 		if err != nil {
 			logger.Error("outbox: failed to update message outcome", "id", m.id, "error", err)
+		} else {
+			status := "delivered"
+			if deliveryErr != nil {
+				if nextAttempt >= maxAttempts {
+					status = "failed"
+				} else {
+					status = "retried"
+				}
+			}
+			r.Meter.Int64Counter("outbox.events").Add(ctx, 1, map[string]string{
+				"status": status,
+				"type":   m.eventType,
+			})
 		}
 	}
 

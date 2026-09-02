@@ -6,8 +6,31 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 )
+
+func engineVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "v0.0.0"
+	}
+	// Typically, devengine is a module dependency of this binary if it was
+	// built via 'go install github.com/andreunix/devengine/cmd/devengine@latest'
+	// Let's check info.Deps first.
+	for _, dep := range info.Deps {
+		if dep.Path == "github.com/andreunix/devengine" {
+			if dep.Version != "" && dep.Version != "(devel)" {
+				return dep.Version
+			}
+		}
+	}
+	// Fallback to Main.Version if the binary itself is the module (e.g. go build in repo)
+	if info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return "v0.0.0"
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -96,10 +119,10 @@ func scaffold(module, appName, dir, profile string) error {
 		files = append(files, httpFiles(module, appName)...)
 	case "worker":
 		files = append(files, workerFiles(module, appName)...)
+		files = append(files, workerComponentFile(module, appName)...)
 	case "combined":
-		files = append(files, httpFiles(module, appName)...)
-		files = append(files, workerFiles(module, appName)...)
 		files = append(files, combinedMainFile(module, appName)...)
+		files = append(files, workerComponentFile(module, appName)...)
 	}
 
 	for _, f := range files {
@@ -126,7 +149,7 @@ func baseFiles(module, appName, profile string) []scaffoldFile {
 	return []scaffoldFile{
 		{
 			path:    "go.mod",
-			content: "module {{MODULE}}\n\ngo 1.27.0\n\nrequire github.com/andreunix/devengine v0.0.0\n",
+			content: "module {{MODULE}}\n\ngo 1.27.0\n\nrequire github.com/andreunix/devengine " + engineVersion() + "\n",
 		},
 		{
 			path:    ".gitignore",
@@ -138,11 +161,11 @@ func baseFiles(module, appName, profile string) []scaffoldFile {
 		},
 		{
 			path:    "internal/app/app.go",
-			content: appFile(),
+			content: appFile(profile),
 		},
 		{
 			path:    "internal/modules/example/module.go",
-			content: exampleModuleFile(),
+			content: exampleModuleFile(profile),
 		},
 		{
 			path:    "Makefile",
@@ -179,12 +202,23 @@ func workerFiles(module, appName string) []scaffoldFile {
 
 func combinedMainFile(module, appName string) []scaffoldFile {
 	return []scaffoldFile{
-		// combined already includes cmd/server and cmd/worker above;
-		// no separate combined binary generated.
+		{
+			path:    "cmd/app/main.go",
+			content: appMainFile(),
+		},
 	}
 }
 
-func appFile() string {
+func workerComponentFile(module, appName string) []scaffoldFile {
+	return []scaffoldFile{
+		{
+			path:    "internal/modules/example/worker.go",
+			content: exampleWorkerFile(),
+		},
+	}
+}
+
+func appFile(profile string) string {
 	return `package app
 
 import (
@@ -218,7 +252,11 @@ func New(logger *slog.Logger, opts ...engine.Option) (*engine.Engine, error) {
 `
 }
 
-func exampleModuleFile() string {
+func exampleModuleFile(profile string) string {
+	workerReg := ""
+	if profile == "worker" || profile == "combined" {
+		workerReg = "\n    _ = app.AddWorker(NewExampleWorker())"
+	}
 	return `package example
 
 import (
@@ -237,8 +275,38 @@ func (*Module) Name() string { return "example" }
 func (*Module) Register(app *engine.Engine) error {
     app.HandleFunc("GET /api/example", func(w http.ResponseWriter, r *http.Request) {
         _ = httpx.Encode(w, http.StatusOK, map[string]string{"status": "ok"})
-    })
+    })` + workerReg + `
     return nil
+}
+`
+}
+
+func exampleWorkerFile() string {
+	return `package example
+
+import (
+    "context"
+    "log/slog"
+    "time"
+)
+
+type ExampleWorker struct{}
+
+func NewExampleWorker() *ExampleWorker { return &ExampleWorker{} }
+
+func (*ExampleWorker) Name() string { return "example-worker" }
+
+func (*ExampleWorker) Run(ctx context.Context) error {
+    ticker := time.NewTicker(30 * time.Second)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return nil
+        case <-ticker.C:
+            slog.Info("example worker tick")
+        }
+    }
 }
 `
 }
@@ -297,6 +365,33 @@ func main() {
 `
 }
 
+func appMainFile() string {
+	return `package main
+
+import (
+    "context"
+    "log/slog"
+    "os"
+
+    "github.com/andreunix/devengine/engine"
+    "{{MODULE}}/internal/app"
+)
+
+func main() {
+    logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+    appEngine, err := app.New(logger, engine.WithProfile(engine.ProfileHTTPAndWorker))
+    if err != nil {
+        logger.Error("init", "error", err)
+        os.Exit(1)
+    }
+    if err := appEngine.Run(context.Background()); err != nil {
+        logger.Error("run", "error", err)
+        os.Exit(1)
+    }
+}
+`
+}
+
 func makefileContent(profile string) string {
 	targets := `.PHONY: test vet fmt run migrate
 
@@ -318,7 +413,7 @@ migrate:
 	case "http":
 		targets += "\nrun:\n\tgo run ./cmd/server\n"
 	default:
-		targets += "\nrun:\n\tgo run ./cmd/server\n\nrun-worker:\n\tgo run ./cmd/worker\n"
+		targets += "\nrun:\n\tgo run ./cmd/app\n"
 	}
 	return targets
 }
