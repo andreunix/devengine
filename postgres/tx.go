@@ -42,6 +42,18 @@ var defaultRetryConfig = RetryConfig{
 // a savepoint instead of a new top-level transaction, implementing nested
 // transaction semantics.
 //
+// The provided fn receives a txCtx which MUST be passed to subsequent
+// db.Querier(txCtx) calls. This ensures cross-repository operations participate
+// in the same transaction.
+//
+// Example:
+//
+//	db.WithTransaction(ctx, func(txCtx context.Context, tx pgx.Tx) error {
+//	    if err := userRepo.Create(txCtx, user); err != nil { return err }
+//	    if err := logRepo.Record(txCtx, "user_created"); err != nil { return err }
+//	    return nil
+//	})
+//
 // Transient errors whose SQLSTATE matches cfg.RetryOn cause automatic retry up
 // to cfg.MaxAttempts times with exponential jitter backoff.
 //
