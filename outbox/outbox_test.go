@@ -8,6 +8,7 @@ import (
 	"github.com/andreunix/devengine/events"
 	"github.com/andreunix/devengine/outbox"
 	testpostgres "github.com/andreunix/devengine/testutil/postgres"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestOutboxUnhandledPolicy(t *testing.T) {
@@ -27,7 +28,6 @@ func TestOutboxUnhandledPolicy(t *testing.T) {
 		Registry: registry,
 		Config: outbox.RelayConfig{
 			BatchSize:    10,
-			MaxAttempts:  1,
 			PollInterval: time.Millisecond * 10,
 		},
 	}
@@ -71,6 +71,9 @@ func TestOutboxUnhandledPolicy(t *testing.T) {
 func TestRelayRequiresDependencies(t *testing.T) {
 	if err := (&outbox.Relay{}).Run(context.Background()); err == nil {
 		t.Fatal("expected pool error")
+	}
+	if err := (&outbox.Relay{Pool: &pgxpool.Pool{}}).Run(context.Background()); err == nil {
+		t.Fatal("expected registry error")
 	}
 }
 

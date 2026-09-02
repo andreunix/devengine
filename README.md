@@ -71,6 +71,7 @@ err := db.WithTransaction(ctx, func(txCtx context.Context, tx pgx.Tx) error {
 ```
 
 `outbox.Enqueue` e `jobs.Enqueue` devem ser chamados nessa transação. Entrega é at-least-once: handlers precisam ser idempotentes; tokens de lease impedem que um worker stale grave o outcome de um owner novo.
+No outbox, `outbox_messages.max_attempts` é a autoridade por mensagem para retries.
 
 ```go
 // Dentro de db.WithTransaction: evento e alteração de domínio são atômicos.

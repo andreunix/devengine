@@ -39,7 +39,6 @@ const (
 	defaultTable        = "outbox_messages"
 	defaultBatchSize    = 50
 	defaultPollInterval = 2 * time.Second
-	defaultMaxAttempts  = 5
 )
 
 // Schema bootstraps the outbox table for ephemeral tests only. Production
@@ -71,8 +70,6 @@ type RelayConfig struct {
 	BatchSize int
 	// PollInterval is how often the relay checks for pending messages.
 	PollInterval time.Duration
-	// MaxAttempts is the total number of delivery attempts before a message is failed.
-	MaxAttempts int
 	// InitialBackoff is the base delay before the first retry.
 	InitialBackoff time.Duration
 	// LeaseDuration is the maximum time a relay owns a claimed message.
@@ -98,13 +95,6 @@ func (c *RelayConfig) pollInterval() time.Duration {
 		return c.PollInterval
 	}
 	return defaultPollInterval
-}
-
-func (c *RelayConfig) maxAttempts() int {
-	if c.MaxAttempts > 0 {
-		return c.MaxAttempts
-	}
-	return defaultMaxAttempts
 }
 
 func (c *RelayConfig) initialBackoff() time.Duration {
@@ -149,6 +139,7 @@ func Enqueue(ctx context.Context, tx pgx.Tx, event events.Event, table string) e
 }
 
 // Relay is a background worker that polls the outbox table and delivers events.
+// outbox_messages.max_attempts is the sole authority for retry limits.
 type Relay struct {
 	Pool     *pgxpool.Pool
 	Registry *events.Registry

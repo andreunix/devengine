@@ -11,6 +11,7 @@ import (
 
 	"github.com/andreunix/devengine/jobs"
 	testpostgres "github.com/andreunix/devengine/testutil/postgres"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestSchemaIsValidAndIdempotent(t *testing.T) {
@@ -45,6 +46,9 @@ func TestSchemaIsValidAndIdempotent(t *testing.T) {
 func TestWorkerRequiresDependencies(t *testing.T) {
 	if err := (&jobs.Worker{}).Run(context.Background()); err == nil {
 		t.Fatal("expected pool error")
+	}
+	if err := (&jobs.Worker{Pool: &pgxpool.Pool{}}).Run(context.Background()); err == nil {
+		t.Fatal("expected registry error")
 	}
 }
 

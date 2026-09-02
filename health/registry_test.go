@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -55,5 +56,21 @@ func TestHandlerDoesNotMultiplyStuckChecks(t *testing.T) {
 	case <-started:
 		t.Fatal("stuck check started more than once")
 	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func TestCooperativeCheckRunsAgain(t *testing.T) {
+	r := NewRegistry()
+	var calls atomic.Int32
+	r.Add("cooperative", func(context.Context) error { calls.Add(1); return nil })
+	for range 2 {
+		w := httptest.NewRecorder()
+		r.Handler("svc").ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		if w.Code != http.StatusOK {
+			t.Fatal(w.Code)
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls = %d", calls.Load())
 	}
 }
