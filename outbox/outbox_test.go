@@ -40,24 +40,28 @@ func TestOutboxUnhandledPolicy(t *testing.T) {
 	}, "")
 	tx.Commit(ctx)
 
-	// Run relay for a short time
-	relayCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer cancel()
-	_ = relay.Run(relayCtx)
+	relayCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- relay.Run(relayCtx) }()
+	t.Cleanup(func() { cancel(); <-done })
 
-	// Verify the message was marked as failed because there was no handler
-	var failedAt *time.Time
-	var lastError string
-	err = db.Pool().QueryRow(ctx, `SELECT failed_at, last_error FROM outbox_messages WHERE id = 'evt_1'`).Scan(&failedAt, &lastError)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if failedAt == nil {
-		t.Fatal("expected message to be marked as failed")
-	}
-	if lastError == "" {
-		t.Fatal("expected last_error to be populated")
+	// Wait for the persisted outcome instead of racing a short context timeout.
+	deadline := time.After(2 * time.Second)
+	for {
+		var failedAt *time.Time
+		var lastError *string
+		err = db.Pool().QueryRow(ctx, `SELECT failed_at, last_error FROM outbox_messages WHERE id = 'evt_1'`).Scan(&failedAt, &lastError)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if failedAt != nil && lastError != nil && *lastError != "" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("message was not marked failed")
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 
