@@ -1,8 +1,10 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -45,6 +47,15 @@ type SecretValue string
 func (s SecretValue) String() string {
 	return "***REDACTED***"
 }
+
+// LogValue prevents structured log handlers from serializing the secret.
+func (s SecretValue) LogValue() slog.Value { return slog.StringValue(s.String()) }
+
+// MarshalJSON prevents accidental serialization of the underlying value.
+func (s SecretValue) MarshalJSON() ([]byte, error) { return json.Marshal(s.String()) }
+
+// MarshalText protects text-based serializers.
+func (s SecretValue) MarshalText() ([]byte, error) { return []byte(s.String()), nil }
 
 // Reveal returns the actual sensitive string.
 func (s SecretValue) Reveal() string {

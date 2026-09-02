@@ -149,9 +149,28 @@ func (r *Registry) Handler(service string) http.Handler {
 					}
 				}()
 
-				if err := e.check(ctx); err != nil {
+				resultCh := make(chan error, 1)
+				go func() {
+					defer func() {
+						if recover() != nil {
+							resultCh <- errCheckPanic{}
+						}
+					}()
+					resultCh <- e.check(ctx)
+				}()
+				var err error
+				select {
+				case err = <-resultCh:
+				case <-ctx.Done():
+					err = ctx.Err()
+				}
+				if err != nil {
 					cr.Status = "error"
-					cr.Error = err.Error()
+					if _, ok := err.(errCheckPanic); ok {
+						cr.Error = "internal check panic"
+					} else {
+						cr.Error = err.Error()
+					}
 				}
 				ch <- result{name: name, res: cr}
 			}()
@@ -183,6 +202,10 @@ func (r *Registry) Handler(service string) http.Handler {
 		})
 	})
 }
+
+type errCheckPanic struct{}
+
+func (errCheckPanic) Error() string { return "internal check panic" }
 
 func criticalityString(c Criticality) string {
 	if c == Informational {

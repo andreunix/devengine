@@ -60,3 +60,31 @@ func TestOutboxUnhandledPolicy(t *testing.T) {
 		t.Fatal("expected last_error to be populated")
 	}
 }
+
+func TestStaleClaimCannotCompleteOutboxMessage(t *testing.T) {
+	db := testpostgres.NewIsolatedDatabase(t)
+	ctx := context.Background()
+	if _, err := db.Pool().Exec(ctx, outbox.Schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool().Exec(ctx, `INSERT INTO outbox_messages (id, event_type, occurred_at) VALUES ('lease-event', 'test', NOW())`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool().Exec(ctx, `UPDATE outbox_messages SET claim_token = 'second', locked_until = NOW() + interval '1 second' WHERE id = 'lease-event'`); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Pool().Exec(ctx, `UPDATE outbox_messages SET processed_at = NOW() WHERE id = 'lease-event' AND claim_token = 'first'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RowsAffected() != 0 {
+		t.Fatal("stale claim completed outbox message")
+	}
+	var token string
+	if err := db.Pool().QueryRow(ctx, `SELECT claim_token FROM outbox_messages WHERE id = 'lease-event'`).Scan(&token); err != nil {
+		t.Fatal(err)
+	}
+	if token != "second" {
+		t.Fatalf("claim token = %q", token)
+	}
+}

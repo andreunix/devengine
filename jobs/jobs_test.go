@@ -42,6 +42,38 @@ func TestSchemaIsValidAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestStaleClaimCannotCompleteJob(t *testing.T) {
+	db := testpostgres.NewIsolatedDatabase(t)
+	ctx := context.Background()
+	if _, err := db.Pool().Exec(ctx, jobs.Schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool().Exec(ctx, `INSERT INTO devengine_jobs (id, name) VALUES ('lease-job', 'test')`); err != nil {
+		t.Fatal(err)
+	}
+	var first, second string
+	if err := db.Pool().QueryRow(ctx, `UPDATE devengine_jobs SET locked_until = NOW() + interval '1 second', claim_token = 'first' WHERE id = 'lease-job' RETURNING claim_token`).Scan(&first); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Pool().QueryRow(ctx, `UPDATE devengine_jobs SET locked_until = NOW() + interval '1 second', claim_token = 'second' WHERE id = 'lease-job' AND claim_token = $1 RETURNING claim_token`, first).Scan(&second); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Pool().Exec(ctx, `DELETE FROM devengine_jobs WHERE id = 'lease-job' AND claim_token = $1`, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RowsAffected() != 0 {
+		t.Fatal("stale claim deleted job")
+	}
+	var token string
+	if err := db.Pool().QueryRow(ctx, `SELECT claim_token FROM devengine_jobs WHERE id = 'lease-job'`).Scan(&token); err != nil {
+		t.Fatal(err)
+	}
+	if token != second {
+		t.Fatalf("claim token = %q, want %q", token, second)
+	}
+}
+
 func TestJobsExecution(t *testing.T) {
 	db := testpostgres.NewIsolatedDatabase(t)
 

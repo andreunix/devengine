@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"github.com/andreunix/devengine/id"
 	"github.com/andreunix/devengine/telemetry"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -17,6 +18,8 @@ type WorkerConfig struct {
 	BatchSize      int
 	PollInterval   time.Duration
 	InitialBackoff time.Duration
+	// LeaseDuration is the maximum time a worker owns a claimed job.
+	LeaseDuration time.Duration
 }
 
 func (c *WorkerConfig) batchSize() int {
@@ -37,8 +40,17 @@ func (c *WorkerConfig) initialBackoff() time.Duration {
 	}
 	return 500 * time.Millisecond
 }
+func (c *WorkerConfig) leaseDuration() time.Duration {
+	if c.LeaseDuration > 0 {
+		return c.LeaseDuration
+	}
+	return 5 * time.Minute
+}
 
-// Worker is a background worker that polls the jobs table.
+// Worker is a background worker that polls the jobs table. Jobs use leased
+// claims: after LeaseDuration another worker may retry delivery, but only the
+// holder of the current claim token can persist its outcome. Handlers must be
+// idempotent because delivery remains at-least-once.
 type Worker struct {
 	Pool     *pgxpool.Pool
 	Registry *Registry
@@ -84,6 +96,7 @@ type jobRow struct {
 	payload     []byte
 	attempt     int
 	maxAttempts int
+	claimToken  string
 }
 
 func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
@@ -91,11 +104,12 @@ func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
 	defer span.End()
 
 	batch := w.Config.batchSize()
-	leaseDuration := 5 * time.Minute
+	leaseDuration := w.Config.leaseDuration()
+	claimPrefix := id.MustUUIDv7()
 
 	rows, err := w.Pool.Query(ctx, fmt.Sprintf(`
 		UPDATE devengine_jobs
-		SET locked_until = NOW() + $2::interval
+		SET locked_until = NOW() + $2::interval, claim_token = $3 || ':' || id
 		WHERE id IN (
 			SELECT id
 			FROM devengine_jobs
@@ -105,8 +119,8 @@ func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, name, payload, attempt, max_attempts
-	`), batch, fmt.Sprintf("%d seconds", int(leaseDuration.Seconds())))
+		RETURNING id, name, payload, attempt, max_attempts, claim_token
+	`), batch, fmt.Sprintf("%d seconds", int(leaseDuration.Seconds())), claimPrefix)
 	if err != nil {
 		return fmt.Errorf("jobs: claim batch: %w", err)
 	}
@@ -114,7 +128,7 @@ func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
 	var jobs []jobRow
 	for rows.Next() {
 		var j jobRow
-		if err := rows.Scan(&j.id, &j.name, &j.payload, &j.attempt, &j.maxAttempts); err != nil {
+		if err := rows.Scan(&j.id, &j.name, &j.payload, &j.attempt, &j.maxAttempts, &j.claimToken); err != nil {
 			rows.Close()
 			return fmt.Errorf("jobs: scan claim row: %w", err)
 		}
@@ -146,7 +160,7 @@ func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
 		nextAttempt := j.attempt + 1
 
 		if processErr == nil {
-			_, err = w.Pool.Exec(ctx, `DELETE FROM devengine_jobs WHERE id = $1`, j.id)
+			_, err = w.Pool.Exec(ctx, `DELETE FROM devengine_jobs WHERE id = $1 AND claim_token = $2`, j.id, j.claimToken)
 		} else {
 			errMsg := processErr.Error()
 			if len(errMsg) > 1024 {
@@ -156,17 +170,17 @@ func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
 				logger.Error("jobs: job failed permanently",
 					"id", j.id, "name", j.name, "attempts", nextAttempt, "error", processErr)
 				_, err = w.Pool.Exec(ctx, `
-					UPDATE devengine_jobs SET attempt = $2, last_error = $3, locked_until = 'infinity' WHERE id = $1
-				`, j.id, nextAttempt, errMsg)
+					UPDATE devengine_jobs SET attempt = $2, last_error = $3, locked_until = 'infinity' WHERE id = $1 AND claim_token = $4
+				`, j.id, nextAttempt, errMsg, j.claimToken)
 			} else {
 				backoff := w.backoff(nextAttempt)
 				logger.Warn("jobs: job failed, will retry",
 					"id", j.id, "name", j.name, "attempt", nextAttempt, "retry_after", backoff)
 				_, err = w.Pool.Exec(ctx, `
-					UPDATE devengine_jobs SET attempt = $2, run_at = NOW() + $3::interval, locked_until = NULL, last_error = $4 WHERE id = $1
+					UPDATE devengine_jobs SET attempt = $2, run_at = NOW() + $3::interval, locked_until = NULL, claim_token = NULL, last_error = $4 WHERE id = $1 AND claim_token = $5
 				`, j.id, nextAttempt,
 					fmt.Sprintf("%d milliseconds", int(backoff.Milliseconds())),
-					errMsg)
+					errMsg, j.claimToken)
 			}
 		}
 		if err != nil {

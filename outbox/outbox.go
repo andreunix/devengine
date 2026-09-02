@@ -11,8 +11,10 @@
 //
 //   - At-least-once delivery: the relay may deliver a message more than once
 //     on restart; handlers must be idempotent.
-//   - No concurrent delivery: FOR UPDATE SKIP LOCKED ensures two relay workers
-//     never process the same message simultaneously.
+//   - Lease ownership: every claim has a token and only its owner may record an
+//     outcome. After lease expiry, delivery can happen again (at-least-once),
+//     so handlers must remain idempotent; a stale worker cannot overwrite the
+//     newer owner's outcome.
 //   - Atomic enqueue: Enqueue must be called within the domain transaction.
 package outbox
 
@@ -26,6 +28,7 @@ import (
 	"time"
 
 	"github.com/andreunix/devengine/events"
+	"github.com/andreunix/devengine/id"
 	"github.com/andreunix/devengine/telemetry"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -55,6 +58,8 @@ const Schema = `CREATE TABLE IF NOT EXISTS outbox_messages (
 	processed_at  TIMESTAMPTZ,
 	failed_at     TIMESTAMPTZ,
 	last_error    TEXT
+	, locked_until TIMESTAMPTZ
+	, claim_token TEXT
 )`
 
 // RelayConfig configures the Relay worker.
@@ -69,6 +74,8 @@ type RelayConfig struct {
 	MaxAttempts int
 	// InitialBackoff is the base delay before the first retry.
 	InitialBackoff time.Duration
+	// LeaseDuration is the maximum time a relay owns a claimed message.
+	LeaseDuration time.Duration
 }
 
 func (c *RelayConfig) table() string {
@@ -104,6 +111,12 @@ func (c *RelayConfig) initialBackoff() time.Duration {
 		return c.InitialBackoff
 	}
 	return 500 * time.Millisecond
+}
+func (c *RelayConfig) leaseDuration() time.Duration {
+	if c.LeaseDuration > 0 {
+		return c.LeaseDuration
+	}
+	return 5 * time.Minute
 }
 
 // Enqueue writes event into the outbox table within tx. It must be called
@@ -183,6 +196,7 @@ type outboxRow struct {
 	schemaVersion int
 	occurredAt    time.Time
 	attempt       int
+	claimToken    string
 }
 
 func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
@@ -192,12 +206,13 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 	table := r.Config.table()
 	batch := r.Config.batchSize()
 	maxAttempts := r.Config.maxAttempts()
-	leaseDuration := 5 * time.Minute
+	leaseDuration := r.Config.leaseDuration()
+	claimPrefix := id.MustUUIDv7()
 
 	// Claim messages and lease them so other workers don't pick them up.
 	rows, err := r.Pool.Query(ctx, fmt.Sprintf(`
 		UPDATE %s
-		SET process_after = NOW() + $2::interval
+		SET process_after = NOW() + $2::interval, locked_until = NOW() + $2::interval, claim_token = $3 || ':' || id
 		WHERE id IN (
 			SELECT id
 			FROM %s
@@ -208,8 +223,8 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, event_type, aggregate_id, aggregate_type, payload, schema_version, occurred_at, attempt
-	`, table, table), batch, fmt.Sprintf("%d seconds", int(leaseDuration.Seconds())))
+		RETURNING id, event_type, aggregate_id, aggregate_type, payload, schema_version, occurred_at, attempt, claim_token
+	`, table, table), batch, fmt.Sprintf("%d seconds", int(leaseDuration.Seconds())), claimPrefix)
 	if err != nil {
 		return fmt.Errorf("outbox: claim batch: %w", err)
 	}
@@ -218,7 +233,7 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 	for rows.Next() {
 		var m outboxRow
 		if err := rows.Scan(&m.id, &m.eventType, &m.aggregateID, &m.aggregateType,
-			&m.payload, &m.schemaVersion, &m.occurredAt, &m.attempt); err != nil {
+			&m.payload, &m.schemaVersion, &m.occurredAt, &m.attempt, &m.claimToken); err != nil {
 			rows.Close()
 			return fmt.Errorf("outbox: scan claim row: %w", err)
 		}
@@ -254,8 +269,8 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 
 		if deliveryErr == nil {
 			_, err = r.Pool.Exec(ctx, fmt.Sprintf(`
-				UPDATE %s SET processed_at = NOW() WHERE id = $1
-			`, table), m.id)
+				UPDATE %s SET processed_at = NOW() WHERE id = $1 AND claim_token = $2
+			`, table), m.id, m.claimToken)
 		} else {
 			errMsg := deliveryErr.Error()
 			if len(errMsg) > 1024 {
@@ -265,17 +280,17 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 				logger.Error("outbox: message failed permanently",
 					"id", m.id, "type", m.eventType, "attempts", nextAttempt, "error", deliveryErr)
 				_, err = r.Pool.Exec(ctx, fmt.Sprintf(`
-					UPDATE %s SET failed_at = NOW(), attempt = $2, last_error = $3 WHERE id = $1
-				`, table), m.id, nextAttempt, errMsg)
+					UPDATE %s SET failed_at = NOW(), attempt = $2, last_error = $3 WHERE id = $1 AND claim_token = $4
+				`, table), m.id, nextAttempt, errMsg, m.claimToken)
 			} else {
 				backoff := r.backoff(nextAttempt)
 				logger.Warn("outbox: delivery failed, will retry",
 					"id", m.id, "type", m.eventType, "attempt", nextAttempt, "retry_after", backoff)
 				_, err = r.Pool.Exec(ctx, fmt.Sprintf(`
-					UPDATE %s SET attempt = $2, process_after = NOW() + $3::interval, last_error = $4 WHERE id = $1
+					UPDATE %s SET attempt = $2, process_after = NOW() + $3::interval, locked_until = NULL, claim_token = NULL, last_error = $4 WHERE id = $1 AND claim_token = $5
 				`, table), m.id, nextAttempt,
 					fmt.Sprintf("%d milliseconds", int(backoff.Milliseconds())),
-					errMsg)
+					errMsg, m.claimToken)
 			}
 		}
 		if err != nil {

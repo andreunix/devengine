@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS devengine_jobs (
 	max_attempts INT NOT NULL DEFAULT 5,
 	last_error TEXT,
 	locked_until TIMESTAMPTZ,
+	claim_token TEXT,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
