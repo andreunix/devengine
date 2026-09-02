@@ -10,6 +10,7 @@ import (
 
 	"github.com/andreunix/devengine/id"
 	"github.com/andreunix/devengine/telemetry"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -65,6 +66,12 @@ func (w *Worker) Name() string { return "jobs-worker" }
 
 // Run starts the polling loop.
 func (w *Worker) Run(ctx context.Context) error {
+	if w.Pool == nil {
+		return errors.New("jobs: worker pool is required")
+	}
+	if w.Registry == nil {
+		return errors.New("jobs: worker registry is required")
+	}
 	logger := w.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -158,9 +165,10 @@ func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
 		jobSpan.End()
 
 		nextAttempt := j.attempt + 1
+		var tag pgconn.CommandTag
 
 		if processErr == nil {
-			_, err = w.Pool.Exec(ctx, `DELETE FROM devengine_jobs WHERE id = $1 AND claim_token = $2`, j.id, j.claimToken)
+			tag, err = w.Pool.Exec(ctx, `DELETE FROM devengine_jobs WHERE id = $1 AND claim_token = $2`, j.id, j.claimToken)
 		} else {
 			errMsg := processErr.Error()
 			if len(errMsg) > 1024 {
@@ -169,14 +177,14 @@ func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
 			if nextAttempt >= j.maxAttempts {
 				logger.Error("jobs: job failed permanently",
 					"id", j.id, "name", j.name, "attempts", nextAttempt, "error", processErr)
-				_, err = w.Pool.Exec(ctx, `
+				tag, err = w.Pool.Exec(ctx, `
 					UPDATE devengine_jobs SET attempt = $2, last_error = $3, locked_until = 'infinity' WHERE id = $1 AND claim_token = $4
 				`, j.id, nextAttempt, errMsg, j.claimToken)
 			} else {
 				backoff := w.backoff(nextAttempt)
 				logger.Warn("jobs: job failed, will retry",
 					"id", j.id, "name", j.name, "attempt", nextAttempt, "retry_after", backoff)
-				_, err = w.Pool.Exec(ctx, `
+				tag, err = w.Pool.Exec(ctx, `
 					UPDATE devengine_jobs SET attempt = $2, run_at = NOW() + $3::interval, locked_until = NULL, claim_token = NULL, last_error = $4 WHERE id = $1 AND claim_token = $5
 				`, j.id, nextAttempt,
 					fmt.Sprintf("%d milliseconds", int(backoff.Milliseconds())),
@@ -185,6 +193,9 @@ func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
 		}
 		if err != nil {
 			logger.Error("jobs: failed to update job outcome", "id", j.id, "error", err)
+		} else if tag.RowsAffected() != 1 {
+			logger.Warn("jobs: claim lost", "id", j.id, "name", j.name)
+			w.Meter.Int64Counter("jobs.processed").Add(ctx, 1, map[string]string{"status": "claim_lost", "name": j.name})
 		} else {
 			status := "processed"
 			if processErr != nil {

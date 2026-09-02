@@ -120,7 +120,7 @@ Enquanto privado, configure `GOPRIVATE=github.com/andreunix/*` e credenciais Git
 
 ## CI
 
-The project uses GitHub Actions with `gofmt`, `go vet ./...`, and `go test -race ./...` on every push and pull request. Baseline: **Go 1.27**.
+The project uses GitHub Actions with `gofmt`, `go vet ./...`, and `go test -race ./...` on every push and pull request. Supported PostgreSQL versions: **17 and 18**. Baseline: **Go 1.27**.
 
 ## License
 

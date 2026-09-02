@@ -42,6 +42,12 @@ func TestSchemaIsValidAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestWorkerRequiresDependencies(t *testing.T) {
+	if err := (&jobs.Worker{}).Run(context.Background()); err == nil {
+		t.Fatal("expected pool error")
+	}
+}
+
 func TestStaleClaimCannotCompleteJob(t *testing.T) {
 	db := testpostgres.NewIsolatedDatabase(t)
 	ctx := context.Background()

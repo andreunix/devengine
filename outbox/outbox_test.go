@@ -39,6 +39,9 @@ func TestOutboxUnhandledPolicy(t *testing.T) {
 		OccurredAt: time.Now(),
 	}, "")
 	tx.Commit(ctx)
+	if _, err := db.Pool().Exec(ctx, `UPDATE outbox_messages SET max_attempts = 1 WHERE id = 'evt_1'`); err != nil {
+		t.Fatal(err)
+	}
 
 	relayCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
@@ -62,6 +65,12 @@ func TestOutboxUnhandledPolicy(t *testing.T) {
 			t.Fatal("message was not marked failed")
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+func TestRelayRequiresDependencies(t *testing.T) {
+	if err := (&outbox.Relay{}).Run(context.Background()); err == nil {
+		t.Fatal("expected pool error")
 	}
 }
 

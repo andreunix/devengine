@@ -35,12 +35,14 @@ type Registry struct {
 	checks  map[string]entry
 	timeout time.Duration
 	verbose bool
+	running map[string]bool
 }
 
 // NewRegistry creates a Registry with a 2-second per-check timeout.
 func NewRegistry() *Registry {
 	return &Registry{
 		checks:  make(map[string]entry),
+		running: make(map[string]bool),
 		timeout: 2 * time.Second,
 	}
 }
@@ -140,6 +142,15 @@ func (r *Registry) Handler(service string) http.Handler {
 					Status:      "ok",
 					Criticality: criticalityString(e.criticality),
 				}
+				r.mu.Lock()
+				if r.running[name] {
+					r.mu.Unlock()
+					cr.Status, cr.Error = "error", "check already running"
+					ch <- result{name: name, res: cr}
+					return
+				}
+				r.running[name] = true
+				r.mu.Unlock()
 
 				defer func() {
 					if rec := recover(); rec != nil {
@@ -151,6 +162,7 @@ func (r *Registry) Handler(service string) http.Handler {
 
 				resultCh := make(chan error, 1)
 				go func() {
+					defer func() { r.mu.Lock(); delete(r.running, name); r.mu.Unlock() }()
 					defer func() {
 						if recover() != nil {
 							resultCh <- errCheckPanic{}

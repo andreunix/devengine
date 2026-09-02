@@ -31,6 +31,7 @@ import (
 	"github.com/andreunix/devengine/id"
 	"github.com/andreunix/devengine/telemetry"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -162,6 +163,12 @@ func (r *Relay) Name() string { return "outbox-relay" }
 
 // Run starts the relay loop. It returns when ctx is cancelled.
 func (r *Relay) Run(ctx context.Context) error {
+	if r.Pool == nil {
+		return errors.New("outbox: relay pool is required")
+	}
+	if r.Registry == nil {
+		return errors.New("outbox: relay registry is required")
+	}
 	logger := r.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -196,6 +203,7 @@ type outboxRow struct {
 	schemaVersion int
 	occurredAt    time.Time
 	attempt       int
+	maxAttempts   int
 	claimToken    string
 }
 
@@ -205,7 +213,6 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 
 	table := r.Config.table()
 	batch := r.Config.batchSize()
-	maxAttempts := r.Config.maxAttempts()
 	leaseDuration := r.Config.leaseDuration()
 	claimPrefix := id.MustUUIDv7()
 
@@ -223,7 +230,7 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, event_type, aggregate_id, aggregate_type, payload, schema_version, occurred_at, attempt, claim_token
+		RETURNING id, event_type, aggregate_id, aggregate_type, payload, schema_version, occurred_at, attempt, max_attempts, claim_token
 	`, table, table), batch, fmt.Sprintf("%d seconds", int(leaseDuration.Seconds())), claimPrefix)
 	if err != nil {
 		return fmt.Errorf("outbox: claim batch: %w", err)
@@ -233,7 +240,7 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 	for rows.Next() {
 		var m outboxRow
 		if err := rows.Scan(&m.id, &m.eventType, &m.aggregateID, &m.aggregateType,
-			&m.payload, &m.schemaVersion, &m.occurredAt, &m.attempt, &m.claimToken); err != nil {
+			&m.payload, &m.schemaVersion, &m.occurredAt, &m.attempt, &m.maxAttempts, &m.claimToken); err != nil {
 			rows.Close()
 			return fmt.Errorf("outbox: scan claim row: %w", err)
 		}
@@ -266,9 +273,10 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 		evSpan.End()
 
 		nextAttempt := m.attempt + 1
+		var tag pgconn.CommandTag
 
 		if deliveryErr == nil {
-			_, err = r.Pool.Exec(ctx, fmt.Sprintf(`
+			tag, err = r.Pool.Exec(ctx, fmt.Sprintf(`
 				UPDATE %s SET processed_at = NOW() WHERE id = $1 AND claim_token = $2
 			`, table), m.id, m.claimToken)
 		} else {
@@ -276,17 +284,17 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 			if len(errMsg) > 1024 {
 				errMsg = errMsg[:1024]
 			}
-			if nextAttempt >= maxAttempts {
+			if nextAttempt >= m.maxAttempts {
 				logger.Error("outbox: message failed permanently",
 					"id", m.id, "type", m.eventType, "attempts", nextAttempt, "error", deliveryErr)
-				_, err = r.Pool.Exec(ctx, fmt.Sprintf(`
+				tag, err = r.Pool.Exec(ctx, fmt.Sprintf(`
 					UPDATE %s SET failed_at = NOW(), attempt = $2, last_error = $3 WHERE id = $1 AND claim_token = $4
 				`, table), m.id, nextAttempt, errMsg, m.claimToken)
 			} else {
 				backoff := r.backoff(nextAttempt)
 				logger.Warn("outbox: delivery failed, will retry",
 					"id", m.id, "type", m.eventType, "attempt", nextAttempt, "retry_after", backoff)
-				_, err = r.Pool.Exec(ctx, fmt.Sprintf(`
+				tag, err = r.Pool.Exec(ctx, fmt.Sprintf(`
 					UPDATE %s SET attempt = $2, process_after = NOW() + $3::interval, locked_until = NULL, claim_token = NULL, last_error = $4 WHERE id = $1 AND claim_token = $5
 				`, table), m.id, nextAttempt,
 					fmt.Sprintf("%d milliseconds", int(backoff.Milliseconds())),
@@ -295,10 +303,13 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 		}
 		if err != nil {
 			logger.Error("outbox: failed to update message outcome", "id", m.id, "error", err)
+		} else if tag.RowsAffected() != 1 {
+			logger.Warn("outbox: claim lost", "id", m.id, "type", m.eventType)
+			r.Meter.Int64Counter("outbox.events").Add(ctx, 1, map[string]string{"status": "claim_lost", "type": m.eventType})
 		} else {
 			status := "delivered"
 			if deliveryErr != nil {
-				if nextAttempt >= maxAttempts {
+				if nextAttempt >= m.maxAttempts {
 					status = "failed"
 				} else {
 					status = "retried"
