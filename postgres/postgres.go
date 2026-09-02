@@ -50,9 +50,20 @@ func Open(ctx context.Context, connString string, opts Options) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse config: %w", err)
 	}
-	applyOptions(cfg, opts)
+	return OpenConfig(ctx, cfg, opts)
+}
 
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+// OpenConfig applies opts to cfg and returns a connected DB. cfg must have
+// been created by pgxpool.ParseConfig. The provided config is not mutated.
+func OpenConfig(ctx context.Context, cfg *pgxpool.Config, opts Options) (*DB, error) {
+	if cfg == nil {
+		return nil, errors.New("postgres: config is nil")
+	}
+
+	poolConfig := cfg.Copy()
+	applyOptions(poolConfig, opts)
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: create pool: %w", err)
 	}

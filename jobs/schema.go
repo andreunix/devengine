@@ -15,7 +15,6 @@ CREATE TABLE IF NOT EXISTS devengine_jobs (
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_devengine_jobs_run_at 
-ON devengine_jobs(run_at) 
-WHERE locked_until IS NULL OR locked_until <= NOW();
+CREATE INDEX IF NOT EXISTS idx_devengine_jobs_schedule
+ON devengine_jobs(run_at, locked_until);
 `

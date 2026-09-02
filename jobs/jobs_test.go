@@ -4,7 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,12 +13,37 @@ import (
 	testpostgres "github.com/andreunix/devengine/testutil/postgres"
 )
 
-func TestJobsExecution(t *testing.T) {
-	if os.Getenv("TEST_DATABASE_URL") == "" {
-		t.Skip("skipping integration test: TEST_DATABASE_URL not set")
-	}
+func TestSchemaIsValidAndIdempotent(t *testing.T) {
 	db := testpostgres.NewIsolatedDatabase(t)
-	defer db.Close()
+	ctx := context.Background()
+
+	for range 2 {
+		if _, err := db.Pool().Exec(ctx, jobs.Schema); err != nil {
+			t.Fatalf("apply jobs schema: %v", err)
+		}
+	}
+
+	var definition string
+	err := db.Pool().QueryRow(ctx, `
+		SELECT indexdef
+		FROM pg_indexes
+		WHERE schemaname = 'public' AND indexname = 'idx_devengine_jobs_schedule'
+	`).Scan(&definition)
+	if err != nil {
+		t.Fatalf("read jobs schedule index: %v", err)
+	}
+
+	definition = strings.ToLower(definition)
+	if strings.Contains(definition, " where ") || strings.Contains(definition, "now(") {
+		t.Fatalf("jobs schedule index must not have a runtime predicate: %s", definition)
+	}
+	if !strings.Contains(definition, "(run_at, locked_until)") {
+		t.Fatalf("jobs schedule index has unexpected columns: %s", definition)
+	}
+}
+
+func TestJobsExecution(t *testing.T) {
+	db := testpostgres.NewIsolatedDatabase(t)
 
 	_, err := db.Pool().Exec(context.Background(), jobs.Schema)
 	if err != nil {
@@ -43,8 +69,19 @@ func TestJobsExecution(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go worker.Run(ctx)
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- worker.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-workerDone:
+			if err != nil {
+				t.Errorf("jobs worker stopped with error: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("jobs worker did not stop after cancellation")
+		}
+	})
 
 	tx, err := db.Pool().Begin(context.Background())
 	if err != nil {
@@ -77,11 +114,7 @@ func TestJobsExecution(t *testing.T) {
 }
 
 func TestJobsRetry(t *testing.T) {
-	if os.Getenv("TEST_DATABASE_URL") == "" {
-		t.Skip("skipping integration test: TEST_DATABASE_URL not set")
-	}
 	db := testpostgres.NewIsolatedDatabase(t)
-	defer db.Close()
 
 	_, err := db.Pool().Exec(context.Background(), jobs.Schema)
 	if err != nil {
@@ -89,10 +122,10 @@ func TestJobsRetry(t *testing.T) {
 	}
 
 	registry := jobs.NewRegistry()
-	attempts := 0
+	var attempts atomic.Int32
 
 	registry.Register("failing_job", jobs.HandlerFunc(func(ctx context.Context, payload []byte) error {
-		attempts++
+		attempts.Add(1)
 		return errors.New("temporary failure")
 	}))
 
@@ -106,8 +139,19 @@ func TestJobsRetry(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go worker.Run(ctx)
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- worker.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-workerDone:
+			if err != nil {
+				t.Errorf("jobs worker stopped with error: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("jobs worker did not stop after cancellation")
+		}
+	})
 
 	tx, err := db.Pool().Begin(context.Background())
 	if err != nil {
@@ -122,24 +166,32 @@ func TestJobsRetry(t *testing.T) {
 	}
 	tx.Commit(context.Background())
 
-	// Wait enough time for 2 attempts
-	time.Sleep(500 * time.Millisecond)
-
-	if attempts != 2 {
-		t.Errorf("expected exactly 2 attempts, got %d", attempts)
+	deadline := time.After(2 * time.Second)
+	for attempts.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("expected 2 attempts, got %d", attempts.Load())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Errorf("expected exactly 2 attempts, got %d", got)
 	}
 
 	// Verify job is marked as failed permanently
 	var lastError string
-	var lockedUntil *time.Time
-	err = db.Pool().QueryRow(context.Background(), `SELECT last_error, locked_until FROM devengine_jobs`).Scan(&lastError, &lockedUntil)
+	var permanentlyLocked bool
+	err = db.Pool().QueryRow(context.Background(), `
+		SELECT last_error, locked_until = 'infinity'::timestamptz
+		FROM devengine_jobs
+	`).Scan(&lastError, &permanentlyLocked)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if lastError != "temporary failure" {
 		t.Errorf("expected last_error to be 'temporary failure', got %q", lastError)
 	}
-	if lockedUntil == nil {
-		t.Error("expected job to be permanently locked ('infinity'), but got NULL")
+	if !permanentlyLocked {
+		t.Error("expected job to be permanently locked ('infinity')")
 	}
 }
