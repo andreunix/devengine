@@ -10,6 +10,8 @@ import (
 )
 
 func TestNewIsolatedDatabaseCreatesDistinctDatabasesInParallel(t *testing.T) {
+	databaseURL(t)
+
 	results := make(chan string, 2)
 	start := make(chan struct{})
 

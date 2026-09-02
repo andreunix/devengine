@@ -105,11 +105,20 @@ func TestJobsExecution(t *testing.T) {
 		t.Fatal("timeout waiting for job to be processed")
 	}
 
-	// Verify job is deleted
-	var count int
-	_ = db.Pool().QueryRow(context.Background(), `SELECT COUNT(*) FROM devengine_jobs`).Scan(&count)
-	if count != 0 {
-		t.Errorf("expected job to be deleted, got %d", count)
+	deadline := time.After(2 * time.Second)
+	for {
+		var count int
+		if err := db.Pool().QueryRow(context.Background(), `SELECT COUNT(*) FROM devengine_jobs`).Scan(&count); err != nil {
+			t.Fatalf("count jobs: %v", err)
+		}
+		if count == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected job to be deleted, got %d", count)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 

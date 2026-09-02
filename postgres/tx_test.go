@@ -3,6 +3,7 @@ package postgres_test
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -131,7 +132,8 @@ func TestWithTransactionContextCancellation(t *testing.T) {
 
 func TestWithTransactionDeadlockRetry(t *testing.T) {
 	db := testpostgres.NewIsolatedDatabase(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
 	_, err := db.Pool().Exec(ctx, `CREATE TABLE tx_test (id INT PRIMARY KEY, val TEXT)`)
 	if err != nil {
@@ -142,62 +144,73 @@ func TestWithTransactionDeadlockRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Wait channels to coordinate the deadlock
-	ready1 := make(chan struct{})
-	ready2 := make(chan struct{})
+	firstLocked := make(chan struct{})
+	secondLocked := make(chan struct{})
+	results := make(chan error, 2)
+	var firstAttempts, secondAttempts atomic.Int32
 
-	var err1, err2 error
-	done := make(chan struct{}, 2)
-
-	// Goroutine 1 locks row 1, waits for Goroutine 2 to lock row 2, then tries to lock row 2
+	// The first attempt from each transaction takes locks in inverse order and
+	// produces a real PostgreSQL deadlock. Retries use a stable lock order, so
+	// they do not consume the one-shot coordination channels or block forever.
 	go func() {
-		err1 = db.WithTransaction(ctx, func(txCtx context.Context, tx pgx.Tx) error {
+		results <- db.WithTransaction(ctx, func(txCtx context.Context, tx pgx.Tx) error {
+			attempt := firstAttempts.Add(1)
+			if attempt > 1 {
+				_, err := db.Querier(txCtx).Exec(txCtx, `SELECT val FROM tx_test WHERE id IN (1, 2) ORDER BY id FOR UPDATE`)
+				return err
+			}
+
 			_, err := db.Querier(txCtx).Exec(txCtx, `SELECT val FROM tx_test WHERE id = 1 FOR UPDATE`)
 			if err != nil {
 				return err
 			}
-			// Signal we got row 1, but only on the first attempt so we don't block retries forever
+			close(firstLocked)
 			select {
-			case ready1 <- struct{}{}:
-			default:
+			case <-secondLocked:
+			case <-txCtx.Done():
+				return txCtx.Err()
 			}
-			// Wait for goroutine 2 to get row 2
-			<-ready2
-			// Now try to get row 2 -> DEADLOCK
+			// Now try to get row 2 -> DEADLOCK.
 			_, err = db.Querier(txCtx).Exec(txCtx, `SELECT val FROM tx_test WHERE id = 2 FOR UPDATE`)
 			return err
 		})
-		done <- struct{}{}
 	}()
 
-	// Goroutine 2 locks row 2, waits for Goroutine 1 to lock row 1, then tries to lock row 1
 	go func() {
-		err2 = db.WithTransaction(ctx, func(txCtx context.Context, tx pgx.Tx) error {
-			<-ready1
+		results <- db.WithTransaction(ctx, func(txCtx context.Context, tx pgx.Tx) error {
+			attempt := secondAttempts.Add(1)
+			if attempt > 1 {
+				_, err := db.Querier(txCtx).Exec(txCtx, `SELECT val FROM tx_test WHERE id IN (1, 2) ORDER BY id FOR UPDATE`)
+				return err
+			}
+
+			select {
+			case <-firstLocked:
+			case <-txCtx.Done():
+				return txCtx.Err()
+			}
 			_, err := db.Querier(txCtx).Exec(txCtx, `SELECT val FROM tx_test WHERE id = 2 FOR UPDATE`)
 			if err != nil {
 				return err
 			}
-			close(ready2)
-			// Small sleep to ensure goroutine 1 gets blocked on row 2 before we try row 1
-			time.Sleep(50 * time.Millisecond)
-			// Now try to get row 1 -> DEADLOCK
+			close(secondLocked)
+			// Now try to get row 1 -> DEADLOCK.
 			_, err = db.Querier(txCtx).Exec(txCtx, `SELECT val FROM tx_test WHERE id = 1 FOR UPDATE`)
 			return err
 		})
-		done <- struct{}{}
 	}()
 
-	<-done
-	<-done
-
-	// One of them should have succeeded (due to retry), the other might have succeeded or failed depending on timing,
-	// but basically Postgres resolves the deadlock by aborting one, and our retry logic should catch it.
-	// Since both are using WithTransaction, they might BOTH eventually succeed if retries are sufficient.
-	if err1 != nil {
-		t.Errorf("Goroutine 1 failed: %v", err1)
+	for range 2 {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Errorf("transaction failed: %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("transactions did not complete: %v", ctx.Err())
+		}
 	}
-	if err2 != nil {
-		t.Errorf("Goroutine 2 failed: %v", err2)
+	if firstAttempts.Load() < 2 && secondAttempts.Load() < 2 {
+		t.Fatal("expected one transaction to retry after the deadlock")
 	}
 }
