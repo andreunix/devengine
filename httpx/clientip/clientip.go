@@ -7,6 +7,7 @@
 package clientip
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"strings"
@@ -109,9 +110,14 @@ type contextKey struct{}
 
 // FromContext retrieves the client IP previously set by the middleware.
 // Returns empty string if not set.
-func FromContext(r *http.Request) string {
-	if v, ok := r.Context().Value(contextKey{}).(string); ok {
+func FromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(contextKey{}).(string); ok {
 		return v
 	}
 	return ""
+}
+
+// WithContext returns a new context carrying the given client IP.
+func WithContext(ctx context.Context, ip string) context.Context {
+	return context.WithValue(ctx, contextKey{}, ip)
 }

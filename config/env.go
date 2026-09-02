@@ -9,45 +9,80 @@ import (
 	"time"
 )
 
+// EnvSource defines how environment variables are looked up.
+type EnvSource interface {
+	Lookup(key string) (string, bool)
+}
+
+type osEnv struct{}
+
+func (osEnv) Lookup(key string) (string, bool) {
+	return os.LookupEnv(key)
+}
+
+// Env is the active environment source. It defaults to reading from the OS,
+// but can be overridden in tests.
+var Env EnvSource = osEnv{}
+
 // String returns the value of key, trimmed of whitespace.
 // If the variable is unset or empty, fallback is returned.
 func String(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return strings.TrimSpace(value)
+	value, ok := Env.Lookup(key)
+	if !ok {
+		return fallback
 	}
-	return fallback
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return fallback
+	}
+	return trimmed
+}
+
+// SecretValue represents a sensitive string. It implements fmt.Stringer
+// to redact its value when printed or logged.
+type SecretValue string
+
+func (s SecretValue) String() string {
+	return "***REDACTED***"
+}
+
+// Reveal returns the actual sensitive string.
+func (s SecretValue) Reveal() string {
+	return string(s)
 }
 
 // Secret returns the value of key like String, but its value is never
 // included in error messages or log attributes to prevent accidental leakage.
-func Secret(key, fallback string) string {
-	return String(key, fallback)
+func Secret(key, fallback string) SecretValue {
+	return SecretValue(String(key, fallback))
 }
 
 // RequiredString returns the trimmed value of key, or an error if it is
 // unset or empty.
 func RequiredString(key string) (string, error) {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
+	value, ok := Env.Lookup(key)
+	trimmed := strings.TrimSpace(value)
+	if !ok || trimmed == "" {
 		return "", fmt.Errorf("configuration: %s is required", key)
 	}
-	return value, nil
+	return trimmed, nil
 }
 
 // RequiredSecret is like RequiredString but the variable is treated as a
 // secret — its name (not value) appears in the error message.
-func RequiredSecret(key string) (string, error) {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
+func RequiredSecret(key string) (SecretValue, error) {
+	value, ok := Env.Lookup(key)
+	trimmed := strings.TrimSpace(value)
+	if !ok || trimmed == "" {
 		return "", fmt.Errorf("configuration: required secret %s is not set", key)
 	}
-	return value, nil
+	return SecretValue(trimmed), nil
 }
 
 // Bool parses a boolean environment variable. Accepts the values understood
 // by strconv.ParseBool (1, t, T, TRUE, true, 0, f, F, FALSE, false).
 func Bool(key string, fallback bool) (bool, error) {
-	value, ok := os.LookupEnv(key)
+	value, ok := Env.Lookup(key)
 	if !ok || strings.TrimSpace(value) == "" {
 		return fallback, nil
 	}
@@ -60,7 +95,7 @@ func Bool(key string, fallback bool) (bool, error) {
 
 // Int parses an integer environment variable.
 func Int(key string, fallback int) (int, error) {
-	value, ok := os.LookupEnv(key)
+	value, ok := Env.Lookup(key)
 	if !ok || strings.TrimSpace(value) == "" {
 		return fallback, nil
 	}
@@ -73,7 +108,7 @@ func Int(key string, fallback int) (int, error) {
 
 // Duration parses a time.Duration environment variable (e.g. "30s", "5m").
 func Duration(key string, fallback time.Duration) (time.Duration, error) {
-	value, ok := os.LookupEnv(key)
+	value, ok := Env.Lookup(key)
 	if !ok || strings.TrimSpace(value) == "" {
 		return fallback, nil
 	}
@@ -87,7 +122,11 @@ func Duration(key string, fallback time.Duration) (time.Duration, error) {
 // CSV returns a slice of trimmed non-empty values from a comma-separated
 // environment variable.
 func CSV(key string) []string {
-	raw := strings.TrimSpace(os.Getenv(key))
+	raw, ok := Env.Lookup(key)
+	if !ok {
+		return nil
+	}
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil
 	}

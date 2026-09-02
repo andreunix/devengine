@@ -1,28 +1,21 @@
 package middleware
 
 import (
-	"context"
 	"net/http"
 	"strings"
 
+	"github.com/andreunix/devengine/httpx/requestid"
 	"github.com/andreunix/devengine/id"
 )
 
-type requestIDKey struct{}
-
 func RequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
-		if requestID == "" || len(requestID) > 128 {
-			requestID = id.MustUUIDv7()
+		reqID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
+		if reqID == "" || len(reqID) > 128 {
+			reqID = id.MustUUIDv7()
 		}
-		w.Header().Set("X-Request-ID", requestID)
-		ctx := context.WithValue(r.Context(), requestIDKey{}, requestID)
+		w.Header().Set("X-Request-ID", reqID)
+		ctx := requestid.WithContext(r.Context(), reqID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
-}
-
-func RequestIDFromContext(ctx context.Context) string {
-	value, _ := ctx.Value(requestIDKey{}).(string)
-	return value
 }

@@ -5,6 +5,8 @@ package problem
 import (
 	"encoding/json"
 	"net/http"
+
+	"github.com/andreunix/devengine/httpx/requestid"
 )
 
 // Problem represents an HTTP API error response following RFC 7807 conventions.
@@ -38,13 +40,13 @@ func Write(w http.ResponseWriter, p Problem) {
 }
 
 // Error writes a minimal problem response with the given status, code and detail.
-// The request ID is extracted from the X-Request-ID response header if already set.
+// The request ID is extracted from the context.
 func Error(w http.ResponseWriter, r *http.Request, status int, code, detail string) {
 	Write(w, Problem{
 		Status:    status,
 		Code:      code,
 		Detail:    detail,
-		RequestID: r.Header.Get("X-Request-ID"),
+		RequestID: requestid.FromContext(r.Context()),
 	})
 }
 

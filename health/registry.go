@@ -34,6 +34,7 @@ type Registry struct {
 	mu      sync.RWMutex
 	checks  map[string]entry
 	timeout time.Duration
+	verbose bool
 }
 
 // NewRegistry creates a Registry with a 2-second per-check timeout.
@@ -73,10 +74,22 @@ func (r *Registry) Remove(name string) {
 }
 
 // SetTimeout overrides the default 2-second per-check timeout.
+// If d is less than or equal to 0, it defaults to 2 seconds.
 func (r *Registry) SetTimeout(d time.Duration) {
+	if d <= 0 {
+		d = 2 * time.Second
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.timeout = d
+}
+
+// SetVerbose enables or disables exposing detailed error messages in the HTTP response.
+// By default, it is false to avoid leaking sensitive information like IPs or DSNs.
+func (r *Registry) SetVerbose(v bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.verbose = v
 }
 
 // CheckResult holds the outcome of a single check.
@@ -103,6 +116,7 @@ func (r *Registry) Handler(service string) http.Handler {
 			snapshot[name] = e
 		}
 		timeout := r.timeout
+		verbose := r.verbose
 		r.mu.RUnlock()
 
 		names := make([]string, 0, len(snapshot))
@@ -126,6 +140,15 @@ func (r *Registry) Handler(service string) http.Handler {
 					Status:      "ok",
 					Criticality: criticalityString(e.criticality),
 				}
+
+				defer func() {
+					if rec := recover(); rec != nil {
+						cr.Status = "error"
+						cr.Error = "internal check panic"
+						ch <- result{name: name, res: cr}
+					}
+				}()
+
 				if err := e.check(ctx); err != nil {
 					cr.Status = "error"
 					cr.Error = err.Error()
@@ -138,6 +161,9 @@ func (r *Registry) Handler(service string) http.Handler {
 		ready := true
 		for range names {
 			r := <-ch
+			if !verbose && r.res.Error != "" {
+				r.res.Error = "redacted"
+			}
 			checks[r.name] = r.res
 			if r.res.Status == "error" && snapshot[r.name].criticality == Critical {
 				ready = false
