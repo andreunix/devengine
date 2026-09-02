@@ -1,0 +1,238 @@
+package engine
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/andreunix/tecno-engine/health"
+)
+
+type serverTimeouts struct {
+	readHeader time.Duration
+	read       time.Duration
+	write      time.Duration
+	idle       time.Duration
+}
+
+// Engine owns process lifecycle and infrastructure surfaces. It deliberately
+// does not own domain repositories, authorization rules or business models.
+type Engine struct {
+	name            string
+	address         string
+	logger          *slog.Logger
+	mux             *http.ServeMux
+	readiness       *health.Registry
+	modules         []Module
+	workers         []Worker
+	middleware      []func(http.Handler) http.Handler
+	shutdownTimeout time.Duration
+	serverTimeouts  serverTimeouts
+
+	mu          sync.Mutex
+	registered  map[string]struct{}
+	workerNames map[string]struct{}
+	started     bool
+}
+
+func New(options ...Option) *Engine {
+	e := &Engine{
+		name:            "tecno-app",
+		address:         ":8080",
+		logger:          slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+		mux:             http.NewServeMux(),
+		readiness:       health.NewRegistry(),
+		shutdownTimeout: 10 * time.Second,
+		serverTimeouts: serverTimeouts{
+			readHeader: 5 * time.Second,
+			read:       30 * time.Second,
+			write:      30 * time.Second,
+			idle:       60 * time.Second,
+		},
+		registered:  make(map[string]struct{}),
+		workerNames: make(map[string]struct{}),
+	}
+	for _, option := range options {
+		option(e)
+	}
+	return e
+}
+
+func (e *Engine) Name() string                { return e.name }
+func (e *Engine) Logger() *slog.Logger        { return e.logger }
+func (e *Engine) Router() *http.ServeMux      { return e.mux }
+func (e *Engine) Readiness() *health.Registry { return e.readiness }
+
+func (e *Engine) Handle(pattern string, handler http.Handler) {
+	e.mux.Handle(pattern, handler)
+}
+
+func (e *Engine) HandleFunc(pattern string, handler http.HandlerFunc) {
+	e.mux.HandleFunc(pattern, handler)
+}
+
+func (e *Engine) Register(modules ...Module) error {
+	for _, module := range modules {
+		if module == nil {
+			return errors.New("engine: nil module")
+		}
+		name := module.Name()
+		if name == "" {
+			return errors.New("engine: module name is required")
+		}
+
+		e.mu.Lock()
+		if e.started {
+			e.mu.Unlock()
+			return errors.New("engine: cannot register modules after start")
+		}
+		if _, exists := e.registered[name]; exists {
+			e.mu.Unlock()
+			return fmt.Errorf("engine: module %q already registered", name)
+		}
+		// Reserve the name before calling the module so recursive registration
+		// cannot create a duplicate. Do not hold the mutex while the module
+		// registers workers or health checks.
+		e.registered[name] = struct{}{}
+		e.mu.Unlock()
+
+		if err := module.Register(e); err != nil {
+			e.mu.Lock()
+			delete(e.registered, name)
+			e.mu.Unlock()
+			return fmt.Errorf("register module %q: %w", name, err)
+		}
+
+		e.mu.Lock()
+		e.modules = append(e.modules, module)
+		e.mu.Unlock()
+	}
+	return nil
+}
+
+func (e *Engine) AddWorker(workers ...Worker) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.started {
+		return errors.New("engine: cannot register workers after start")
+	}
+	for _, worker := range workers {
+		if worker == nil {
+			return errors.New("engine: nil worker")
+		}
+		name := worker.Name()
+		if name == "" {
+			return errors.New("engine: worker name is required")
+		}
+		if _, exists := e.workerNames[name]; exists {
+			return fmt.Errorf("engine: worker %q already registered", name)
+		}
+		e.workerNames[name] = struct{}{}
+		e.workers = append(e.workers, worker)
+	}
+	return nil
+}
+
+// Run starts modules, background workers and HTTP. It returns on context
+// cancellation, SIGINT/SIGTERM, worker failure or HTTP server failure.
+func (e *Engine) Run(ctx context.Context) error {
+	e.mu.Lock()
+	if e.started {
+		e.mu.Unlock()
+		return errors.New("engine: already started")
+	}
+	e.started = true
+	e.mu.Unlock()
+
+	e.installInfrastructureRoutes()
+
+	runCtx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	handler := http.Handler(e.mux)
+	for i := len(e.middleware) - 1; i >= 0; i-- {
+		if e.middleware[i] != nil {
+			handler = e.middleware[i](handler)
+		}
+	}
+
+	server := &http.Server{
+		Addr:              e.address,
+		Handler:           handler,
+		ReadHeaderTimeout: e.serverTimeouts.readHeader,
+		ReadTimeout:       e.serverTimeouts.read,
+		WriteTimeout:      e.serverTimeouts.write,
+		IdleTimeout:       e.serverTimeouts.idle,
+	}
+
+	errCh := make(chan error, len(e.workers)+1)
+	var wg sync.WaitGroup
+	for _, worker := range e.workers {
+		worker := worker
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.logger.Info("worker started", "service", e.name, "worker", worker.Name())
+			if err := worker.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+				select {
+				case errCh <- fmt.Errorf("worker %q: %w", worker.Name(), err):
+				default:
+				}
+				cancel()
+			}
+		}()
+	}
+
+	go func() {
+		e.logger.Info("http server started", "service", e.name, "address", e.address)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			select {
+			case errCh <- fmt.Errorf("http server: %w", err):
+			default:
+			}
+			cancel()
+		}
+	}()
+
+	var runErr error
+	select {
+	case <-runCtx.Done():
+		runErr = context.Cause(runCtx)
+		if errors.Is(runErr, context.Canceled) {
+			runErr = nil
+		}
+	case runErr = <-errCh:
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), e.shutdownTimeout)
+	defer shutdownCancel()
+	shutdownErr := server.Shutdown(shutdownCtx)
+	cancel()
+	wg.Wait()
+
+	if runErr == nil {
+		select {
+		case runErr = <-errCh:
+		default:
+		}
+	}
+	if runErr != nil && shutdownErr != nil {
+		return errors.Join(runErr, shutdownErr)
+	}
+	if runErr != nil {
+		return runErr
+	}
+	return shutdownErr
+}
+
+func (e *Engine) installInfrastructureRoutes() {
+	e.mux.HandleFunc("GET /healthz", health.LiveHandler(e.name))
+	e.mux.Handle("GET /readyz", e.readiness.Handler(e.name))
+}
