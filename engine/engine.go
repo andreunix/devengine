@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/andreunix/tecno-engine/health"
+	"github.com/andreunix/devengine/health"
 )
 
 type serverTimeouts struct {
@@ -22,11 +22,35 @@ type serverTimeouts struct {
 	idle       time.Duration
 }
 
+// Profile determines which subsystems the engine activates on Run.
+type Profile int
+
+const (
+	// ProfileHTTPAndWorker (default) starts both the HTTP server and background workers.
+	ProfileHTTPAndWorker Profile = iota
+	// ProfileHTTP starts only the HTTP server. Workers are not started.
+	ProfileHTTP
+	// ProfileWorker starts only background workers. No HTTP server is bound.
+	ProfileWorker
+)
+
+func (p Profile) String() string {
+	switch p {
+	case ProfileHTTP:
+		return "http-only"
+	case ProfileWorker:
+		return "worker-only"
+	default:
+		return "http+worker"
+	}
+}
+
 // Engine owns process lifecycle and infrastructure surfaces. It deliberately
 // does not own domain repositories, authorization rules or business models.
 type Engine struct {
 	name            string
 	address         string
+	profile         Profile
 	logger          *slog.Logger
 	mux             *http.ServeMux
 	readiness       *health.Registry
@@ -44,7 +68,7 @@ type Engine struct {
 
 func New(options ...Option) *Engine {
 	e := &Engine{
-		name:            "tecno-app",
+		name:            "devengine-app",
 		address:         ":8080",
 		logger:          slog.New(slog.NewJSONHandler(os.Stdout, nil)),
 		mux:             http.NewServeMux(),
@@ -140,8 +164,12 @@ func (e *Engine) AddWorker(workers ...Worker) error {
 	return nil
 }
 
-// Run starts modules, background workers and HTTP. It returns on context
-// cancellation, SIGINT/SIGTERM, worker failure or HTTP server failure.
+// Run starts the subsystems determined by the engine Profile and returns on
+// context cancellation, SIGINT/SIGTERM, worker failure, or HTTP server failure.
+//
+//   - ProfileHTTPAndWorker (default): starts HTTP server and all workers.
+//   - ProfileHTTP: starts only the HTTP server; workers are not started.
+//   - ProfileWorker: starts only workers; no HTTP server is bound.
 func (e *Engine) Run(ctx context.Context) error {
 	e.mu.Lock()
 	if e.started {
@@ -151,55 +179,63 @@ func (e *Engine) Run(ctx context.Context) error {
 	e.started = true
 	e.mu.Unlock()
 
-	e.installInfrastructureRoutes()
+	e.logger.Info("engine starting", "service", e.name, "profile", e.profile.String())
 
 	runCtx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	handler := http.Handler(e.mux)
-	for i := len(e.middleware) - 1; i >= 0; i-- {
-		if e.middleware[i] != nil {
-			handler = e.middleware[i](handler)
+	errCh := make(chan error, len(e.workers)+1)
+	var wg sync.WaitGroup
+
+	// Start workers unless HTTP-only.
+	if e.profile != ProfileHTTP {
+		for _, worker := range e.workers {
+			worker := worker
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				e.logger.Info("worker started", "service", e.name, "worker", worker.Name())
+				if err := worker.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+					select {
+					case errCh <- fmt.Errorf("worker %q: %w", worker.Name(), err):
+					default:
+					}
+					cancel()
+				}
+			}()
 		}
 	}
 
-	server := &http.Server{
-		Addr:              e.address,
-		Handler:           handler,
-		ReadHeaderTimeout: e.serverTimeouts.readHeader,
-		ReadTimeout:       e.serverTimeouts.read,
-		WriteTimeout:      e.serverTimeouts.write,
-		IdleTimeout:       e.serverTimeouts.idle,
-	}
+	// Start HTTP server unless Worker-only.
+	var server *http.Server
+	if e.profile != ProfileWorker {
+		e.installInfrastructureRoutes()
 
-	errCh := make(chan error, len(e.workers)+1)
-	var wg sync.WaitGroup
-	for _, worker := range e.workers {
-		worker := worker
-		wg.Add(1)
+		handler := http.Handler(e.mux)
+		for i := len(e.middleware) - 1; i >= 0; i-- {
+			if e.middleware[i] != nil {
+				handler = e.middleware[i](handler)
+			}
+		}
+		server = &http.Server{
+			Addr:              e.address,
+			Handler:           handler,
+			ReadHeaderTimeout: e.serverTimeouts.readHeader,
+			ReadTimeout:       e.serverTimeouts.read,
+			WriteTimeout:      e.serverTimeouts.write,
+			IdleTimeout:       e.serverTimeouts.idle,
+		}
 		go func() {
-			defer wg.Done()
-			e.logger.Info("worker started", "service", e.name, "worker", worker.Name())
-			if err := worker.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+			e.logger.Info("http server started", "service", e.name, "address", e.address)
+			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				select {
-				case errCh <- fmt.Errorf("worker %q: %w", worker.Name(), err):
+				case errCh <- fmt.Errorf("http server: %w", err):
 				default:
 				}
 				cancel()
 			}
 		}()
 	}
-
-	go func() {
-		e.logger.Info("http server started", "service", e.name, "address", e.address)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			select {
-			case errCh <- fmt.Errorf("http server: %w", err):
-			default:
-			}
-			cancel()
-		}
-	}()
 
 	var runErr error
 	select {
@@ -211,9 +247,13 @@ func (e *Engine) Run(ctx context.Context) error {
 	case runErr = <-errCh:
 	}
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), e.shutdownTimeout)
-	defer shutdownCancel()
-	shutdownErr := server.Shutdown(shutdownCtx)
+	if server != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), e.shutdownTimeout)
+		defer shutdownCancel()
+		if err := server.Shutdown(shutdownCtx); err != nil && runErr == nil {
+			runErr = err
+		}
+	}
 	cancel()
 	wg.Wait()
 
@@ -223,14 +263,9 @@ func (e *Engine) Run(ctx context.Context) error {
 		default:
 		}
 	}
-	if runErr != nil && shutdownErr != nil {
-		return errors.Join(runErr, shutdownErr)
-	}
-	if runErr != nil {
-		return runErr
-	}
-	return shutdownErr
+	return runErr
 }
+
 
 func (e *Engine) installInfrastructureRoutes() {
 	e.mux.HandleFunc("GET /healthz", health.LiveHandler(e.name))

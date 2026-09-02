@@ -16,6 +16,12 @@ func WithAddress(address string) Option {
 	return func(e *Engine) { e.address = address }
 }
 
+// WithProfile sets the engine profile (ProfileHTTPAndWorker, ProfileHTTP or ProfileWorker).
+// The default is ProfileHTTPAndWorker.
+func WithProfile(p Profile) Option {
+	return func(e *Engine) { e.profile = p }
+}
+
 func WithLogger(logger *slog.Logger) Option {
 	return func(e *Engine) {
 		if logger != nil {

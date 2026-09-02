@@ -25,16 +25,16 @@ func main() {
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "tecno:", err)
+		fmt.Fprintln(os.Stderr, "devengine:", err)
 		os.Exit(1)
 	}
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `tecno — scaffold companion for Tecno Engine
+	fmt.Fprint(os.Stderr, `devengine — scaffold companion for devengine
 
 Usage:
-  tecno new -module github.com/andreunix/my-app [-dir ./my-app]
+  devengine new -module github.com/your-org/my-app [-dir ./my-app]
 `)
 }
 
@@ -58,12 +58,12 @@ func runNew(args []string) error {
 
 func scaffold(module, dir string) error {
 	files := map[string]string{
-		"go.mod":                             "module " + module + "\n\ngo 1.23.0\n\nrequire github.com/andreunix/tecno-engine v0.0.0\n",
+		"go.mod":                             "module " + module + "\n\ngo 1.27.0\n\nrequire github.com/andreunix/devengine v0.0.0\n",
 		".gitignore":                         ".env\n.DS_Store\nbin/\n",
 		"cmd/server/main.go":                 starterMain,
 		"internal/modules/example/module.go": starterModule,
 		"db/migrations/1000_initial.up.sql":  "-- Application migrations start at version 1000.\n",
-		"README.md":                          "# " + filepath.Base(dir) + "\n\nGenerated with Tecno Engine.\n",
+		"README.md":                          "# " + filepath.Base(dir) + "\n\nGenerated with devengine.\n",
 	}
 	for name, content := range files {
 		path := filepath.Join(dir, name)
@@ -91,8 +91,8 @@ import (
     "log/slog"
     "os"
 
-    "github.com/andreunix/tecno-engine/engine"
-    httpmiddleware "github.com/andreunix/tecno-engine/httpx/middleware"
+    "github.com/andreunix/devengine/engine"
+    httpmiddleware "github.com/andreunix/devengine/httpx/middleware"
     "{{MODULE}}/internal/modules/example"
 )
 
@@ -124,7 +124,7 @@ const starterModule = `package example
 
 import (
     "net/http"
-    "github.com/andreunix/tecno-engine/engine"
+    "github.com/andreunix/devengine/engine"
 )
 
 type Module struct{}
