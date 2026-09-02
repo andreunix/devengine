@@ -6,7 +6,9 @@ on:
   pull_request:
 
 jobs:
-  test:
+  # ── Unit tests (no database required) ────────────────────────────────────
+  unit:
+    name: Unit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,3 +32,36 @@ jobs:
 
       - name: test
         run: go test -race ./...
+
+  # ── Integration tests (requires PostgreSQL) ───────────────────────────────
+  integration:
+    name: Integration
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: devengine
+          POSTGRES_PASSWORD: devengine
+          POSTGRES_DB: devengine_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: true
+
+      - name: integration tests
+        env:
+          TEST_DATABASE_URL: postgres://devengine:devengine@localhost:5432/devengine_test?sslmode=disable
+        run: go test -race -count=1 ./...

@@ -9,75 +9,160 @@ import (
 	"time"
 )
 
+// Criticality determines whether a failing check blocks the readiness response.
+type Criticality int
+
+const (
+	// Critical checks must pass for the service to be considered ready.
+	// A single failing critical check causes /readyz to return 503.
+	Critical Criticality = iota
+	// Informational checks are included in the readiness response for
+	// observability, but their failure does not block readiness.
+	Informational
+)
+
+// Check is a function that verifies a dependency is available.
 type Check func(context.Context) error
 
+type entry struct {
+	check       Check
+	criticality Criticality
+}
+
+// Registry holds named health checks and exposes them as HTTP handlers.
 type Registry struct {
 	mu      sync.RWMutex
-	checks  map[string]Check
+	checks  map[string]entry
 	timeout time.Duration
 }
 
+// NewRegistry creates a Registry with a 2-second per-check timeout.
 func NewRegistry() *Registry {
-	return &Registry{checks: make(map[string]Check), timeout: 2 * time.Second}
+	return &Registry{
+		checks:  make(map[string]entry),
+		timeout: 2 * time.Second,
+	}
 }
 
+// Add registers a critical health check under name.
 func (r *Registry) Add(name string, check Check) {
+	r.AddWithCriticality(name, check, Critical)
+}
+
+// AddInformational registers a non-blocking informational health check.
+// Its failure is reported in the response body but does not cause 503.
+func (r *Registry) AddInformational(name string, check Check) {
+	r.AddWithCriticality(name, check, Informational)
+}
+
+// AddWithCriticality registers a check with explicit criticality.
+func (r *Registry) AddWithCriticality(name string, check Check, c Criticality) {
 	if name == "" || check == nil {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.checks[name] = check
+	r.checks[name] = entry{check: check, criticality: c}
 }
 
+// Remove deregisters the named check.
 func (r *Registry) Remove(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.checks, name)
 }
 
+// SetTimeout overrides the default 2-second per-check timeout.
+func (r *Registry) SetTimeout(d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.timeout = d
+}
+
+// CheckResult holds the outcome of a single check.
+type CheckResult struct {
+	Status      string `json:"status"`          // "ok" or "error"
+	Error       string `json:"error,omitempty"` // error message when status is "error"
+	Criticality string `json:"criticality"`     // "critical" or "informational"
+}
+
+// LiveHandler returns a simple liveness probe that always succeeds.
 func LiveHandler(service string) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "service": service})
 	}
 }
 
+// Handler returns an HTTP handler for the readiness endpoint. It runs all
+// registered checks concurrently and returns 503 if any critical check fails.
 func (r *Registry) Handler(service string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		r.mu.RLock()
-		checks := make(map[string]Check, len(r.checks))
-		for name, check := range r.checks {
-			checks[name] = check
+		snapshot := make(map[string]entry, len(r.checks))
+		for name, e := range r.checks {
+			snapshot[name] = e
 		}
+		timeout := r.timeout
 		r.mu.RUnlock()
 
-		names := make([]string, 0, len(checks))
-		for name := range checks {
+		names := make([]string, 0, len(snapshot))
+		for name := range snapshot {
 			names = append(names, name)
 		}
 		sort.Strings(names)
 
-		results := make(map[string]string, len(checks))
-		ready := true
-		for _, name := range names {
-			ctx, cancel := context.WithTimeout(request.Context(), r.timeout)
-			err := checks[name](ctx)
-			cancel()
-			if err != nil {
-				ready = false
-				results[name] = "error"
-				continue
-			}
-			results[name] = "ok"
+		type result struct {
+			name string
+			res  CheckResult
 		}
+		ch := make(chan result, len(names))
+		for _, name := range names {
+			name := name
+			e := snapshot[name]
+			go func() {
+				ctx, cancel := context.WithTimeout(req.Context(), timeout)
+				defer cancel()
+				cr := CheckResult{
+					Status:      "ok",
+					Criticality: criticalityString(e.criticality),
+				}
+				if err := e.check(ctx); err != nil {
+					cr.Status = "error"
+					cr.Error = err.Error()
+				}
+				ch <- result{name: name, res: cr}
+			}()
+		}
+
+		checks := make(map[string]CheckResult, len(names))
+		ready := true
+		for range names {
+			r := <-ch
+			checks[r.name] = r.res
+			if r.res.Status == "error" && snapshot[r.name].criticality == Critical {
+				ready = false
+			}
+		}
+
 		status := http.StatusOK
 		state := "ok"
 		if !ready {
 			status = http.StatusServiceUnavailable
 			state = "not_ready"
 		}
-		writeJSON(w, status, map[string]any{"status": state, "service": service, "checks": results})
+		writeJSON(w, status, map[string]any{
+			"status":  state,
+			"service": service,
+			"checks":  checks,
+		})
 	})
+}
+
+func criticalityString(c Criticality) string {
+	if c == Informational {
+		return "informational"
+	}
+	return "critical"
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

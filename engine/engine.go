@@ -51,6 +51,8 @@ type Engine struct {
 	name            string
 	address         string
 	profile         Profile
+	version         string
+	environment     string
 	logger          *slog.Logger
 	mux             *http.ServeMux
 	readiness       *health.Registry
@@ -179,7 +181,18 @@ func (e *Engine) Run(ctx context.Context) error {
 	e.started = true
 	e.mu.Unlock()
 
-	e.logger.Info("engine starting", "service", e.name, "profile", e.profile.String())
+	// Build a logger enriched with base attributes so every log record
+	// automatically carries service, version and environment.
+	baseAttrs := []any{"service", e.name}
+	if e.version != "" {
+		baseAttrs = append(baseAttrs, "version", e.version)
+	}
+	if e.environment != "" {
+		baseAttrs = append(baseAttrs, "environment", e.environment)
+	}
+	log := e.logger.With(baseAttrs...)
+
+	log.Info("engine starting", "profile", e.profile.String())
 
 	runCtx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -194,7 +207,7 @@ func (e *Engine) Run(ctx context.Context) error {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				e.logger.Info("worker started", "service", e.name, "worker", worker.Name())
+				log.Info("worker started", "worker", worker.Name())
 				if err := worker.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
 					select {
 					case errCh <- fmt.Errorf("worker %q: %w", worker.Name(), err):
@@ -226,7 +239,7 @@ func (e *Engine) Run(ctx context.Context) error {
 			IdleTimeout:       e.serverTimeouts.idle,
 		}
 		go func() {
-			e.logger.Info("http server started", "service", e.name, "address", e.address)
+			log.Info("http server started", "address", e.address)
 			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				select {
 				case errCh <- fmt.Errorf("http server: %w", err):

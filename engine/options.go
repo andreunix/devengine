@@ -22,6 +22,20 @@ func WithProfile(p Profile) Option {
 	return func(e *Engine) { e.profile = p }
 }
 
+// WithVersion attaches a version string to every structured log record emitted
+// by the engine. Consumers typically pass a build-time constant or git tag.
+func WithVersion(version string) Option {
+	return func(e *Engine) { e.version = version }
+}
+
+// WithEnvironment attaches an environment label (e.g. "production", "staging")
+// to every structured log record emitted by the engine.
+func WithEnvironment(env string) Option {
+	return func(e *Engine) { e.environment = env }
+}
+
+// WithLogger replaces the engine's logger. If attrs are set via WithVersion or
+// WithEnvironment, they are added as base attributes on top of the provided logger.
 func WithLogger(logger *slog.Logger) Option {
 	return func(e *Engine) {
 		if logger != nil {
