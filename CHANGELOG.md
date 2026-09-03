@@ -6,6 +6,8 @@ between stable-candidate and experimental packages until v1.0.0.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-03
+
 ### Added
 
 - A strict, configurable client IP resolver supporting RFC 7239 `Forwarded`,
@@ -16,7 +18,7 @@ between stable-candidate and experimental packages until v1.0.0.
 
 - `clientip.ParseTrustedProxies`, `MustParseTrustedProxies`, and `FromRequest`;
   use `clientip.New` and `Resolver.Resolve`. The legacy API remains available
-  throughout the v0.2 release line.
+  throughout the v0.3 release line.
 
 ## [0.2.0] - 2026-09-02
 
@@ -58,6 +60,7 @@ between stable-candidate and experimental packages until v1.0.0.
 
 - Initial development release.
 
-[Unreleased]: https://github.com/andreunix/devengine/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/andreunix/devengine/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/andreunix/devengine/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/andreunix/devengine/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/andreunix/devengine/releases/tag/v0.1.0
