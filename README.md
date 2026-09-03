@@ -20,6 +20,8 @@ The engine deliberately does **not** include domain repositories, authorization 
 | `httpx/middleware` | RequestID, logging, panic recovery, security headers |
 | `config` | Environment variable loading |
 | `id` | UUIDv7 generation |
+| `secrets` | Opaque-secret generation, SHA-256 digests, and AES-256-GCM encryption at rest |
+| `mail` | SMTP transport with TLS, authentication, timeouts, and header sanitization |
 | `events`, `outbox`, `jobs` | Transactional events and at-least-once workers |
 | `schema` | Versioned PostgreSQL snapshots, diffing, and drift detection |
 | `httpx`, `httpx/clientip`, `httpx/middleware`, `httpx/problem`, `httpx/requestid` | Safe HTTP utilities |

@@ -14,7 +14,7 @@ version in `go.mod`; `main` is development state and is not a release channel.
 | --- | --- |
 | Stable candidate | `engine`, `postgres`, `migrate`, `health`, `httpx`, `httpx/clientip`, `httpx/middleware`, `httpx/problem`, `httpx/requestid` |
 | Supporting | `config`, `id`, `testutil/postgres`, `cmd/devengine` |
-| Experimental | `events`, `jobs`, `outbox`, `schema`, `telemetry`, `telemetry/otel` |
+| Experimental | `events`, `jobs`, `mail`, `outbox`, `schema`, `secrets`, `telemetry`, `telemetry/otel` |
 
 Experimental does not mean unsafe; it means the public API may still change in
 a pre-v1 minor release. Every breaking change must be called out in
