@@ -37,11 +37,8 @@ func TestOutboxUnhandledPolicy(t *testing.T) {
 		ID:         "evt_1",
 		Type:       "UserCreated",
 		OccurredAt: time.Now(),
-	}, "")
+	}, outbox.WithMaxAttempts(1))
 	tx.Commit(ctx)
-	if _, err := db.Pool().Exec(ctx, `UPDATE outbox_messages SET max_attempts = 1 WHERE id = 'evt_1'`); err != nil {
-		t.Fatal(err)
-	}
 
 	relayCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
@@ -65,6 +62,47 @@ func TestOutboxUnhandledPolicy(t *testing.T) {
 			t.Fatal("message was not marked failed")
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+func TestEnqueueOptionsPersistMessagePolicy(t *testing.T) {
+	db := testpostgres.NewIsolatedDatabase(t)
+	ctx := context.Background()
+	if _, err := db.Pool().Exec(ctx, outbox.Schema); err != nil {
+		t.Fatal(err)
+	}
+	processAfter := time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
+	tx, err := db.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if err := outbox.Enqueue(ctx, tx, events.Event{
+		ID: "configured", Type: "UserCreated", OccurredAt: time.Now(),
+	}, outbox.WithMaxAttempts(10), outbox.WithProcessAfter(processAfter)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var maxAttempts int
+	var gotProcessAfter time.Time
+	if err := db.Pool().QueryRow(ctx, `
+		SELECT max_attempts, process_after FROM outbox_messages WHERE id = 'configured'
+	`).Scan(&maxAttempts, &gotProcessAfter); err != nil {
+		t.Fatal(err)
+	}
+	if maxAttempts != 10 || !gotProcessAfter.Equal(processAfter) {
+		t.Fatalf("max_attempts=%d process_after=%s", maxAttempts, gotProcessAfter)
+	}
+}
+
+func TestEnqueueRejectsInvalidOptions(t *testing.T) {
+	if err := outbox.WithMaxAttempts(0)(nil); err == nil {
+		t.Fatal("expected invalid max attempts error")
+	}
+	if err := outbox.WithProcessAfter(time.Time{})(nil); err == nil {
+		t.Fatal("expected zero process after error")
 	}
 }
 

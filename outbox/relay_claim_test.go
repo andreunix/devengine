@@ -145,7 +145,7 @@ func TestLeaseRenewalDoesNotReviveExpiredClaim(t *testing.T) {
 	}
 
 	relay := &Relay{Pool: db.Pool(), Config: RelayConfig{LeaseRenewalInterval: 5 * time.Millisecond}}
-	handlerCtx, stop := relay.startLeaseRenewal(ctx, slog.Default(), "outbox_messages", outboxRow{id: "expired-renewal", eventType: "event", claimToken: "owner"}, time.Second)
+	handlerCtx, stop := relay.startLeaseRenewal(ctx, slog.Default(), outboxRow{id: "expired-renewal", eventType: "event", claimToken: "owner"}, time.Second)
 	defer stop()
 	select {
 	case <-handlerCtx.Done():
@@ -168,7 +168,7 @@ func TestLeaseRenewalStopsAfterStop(t *testing.T) {
 	}
 
 	relay := &Relay{Pool: db.Pool(), Config: RelayConfig{LeaseRenewalInterval: 20 * time.Millisecond}}
-	_, stop := relay.startLeaseRenewal(ctx, slog.Default(), "outbox_messages", outboxRow{id: "stop-renewal", eventType: "event", claimToken: "owner"}, 2*time.Second)
+	_, stop := relay.startLeaseRenewal(ctx, slog.Default(), outboxRow{id: "stop-renewal", eventType: "event", claimToken: "owner"}, 2*time.Second)
 	var renewedUntil time.Time
 	deadline := time.After(2 * time.Second)
 	for {

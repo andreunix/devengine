@@ -23,6 +23,11 @@ type serverTimeouts struct {
 	idle       time.Duration
 }
 
+type runningWorker struct {
+	name string
+	done chan struct{}
+}
+
 // Profile determines which subsystems the engine activates on Run.
 type Profile int
 
@@ -49,19 +54,20 @@ func (p Profile) String() string {
 // Engine owns process lifecycle and infrastructure surfaces. It deliberately
 // does not own domain repositories, authorization rules or business models.
 type Engine struct {
-	name            string
-	address         string
-	profile         Profile
-	version         string
-	environment     string
-	logger          *slog.Logger
-	mux             *http.ServeMux
-	readiness       *health.Registry
-	modules         []Module
-	workers         []Worker
-	middleware      []func(http.Handler) http.Handler
-	shutdownTimeout time.Duration
-	serverTimeouts  serverTimeouts
+	name                  string
+	address               string
+	profile               Profile
+	version               string
+	environment           string
+	logger                *slog.Logger
+	mux                   *http.ServeMux
+	readiness             *health.Registry
+	modules               []Module
+	workers               []Worker
+	middleware            []func(http.Handler) http.Handler
+	shutdownTimeout       time.Duration
+	workerShutdownTimeout time.Duration
+	serverTimeouts        serverTimeouts
 
 	tracer telemetry.Tracer
 	meter  telemetry.Meter
@@ -74,12 +80,13 @@ type Engine struct {
 
 func New(options ...Option) *Engine {
 	e := &Engine{
-		name:            "devengine-app",
-		address:         ":8080",
-		logger:          slog.New(slog.NewJSONHandler(os.Stdout, nil)),
-		mux:             http.NewServeMux(),
-		readiness:       health.NewRegistry(),
-		shutdownTimeout: 10 * time.Second,
+		name:                  "devengine-app",
+		address:               ":8080",
+		logger:                slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+		mux:                   http.NewServeMux(),
+		readiness:             health.NewRegistry(),
+		shutdownTimeout:       10 * time.Second,
+		workerShutdownTimeout: 30 * time.Second,
 		serverTimeouts: serverTimeouts{
 			readHeader: 5 * time.Second,
 			read:       30 * time.Second,
@@ -206,17 +213,22 @@ func (e *Engine) Run(ctx context.Context) error {
 	defer cancel()
 
 	errCh := make(chan error, len(e.workers)+1)
-	var wg sync.WaitGroup
+	runningWorkers := make([]runningWorker, 0, len(e.workers))
 
 	// Start workers unless HTTP-only.
 	if e.profile != ProfileHTTP {
 		for _, worker := range e.workers {
 			worker := worker
-			wg.Add(1)
+			state := runningWorker{name: worker.Name(), done: make(chan struct{})}
+			runningWorkers = append(runningWorkers, state)
 			go func() {
-				defer wg.Done()
+				defer close(state.done)
 				log.Info("worker started", "worker", worker.Name())
-				if err := worker.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+				err := worker.Run(runCtx)
+				if err == nil && runCtx.Err() == nil {
+					err = errors.New("exited unexpectedly before shutdown")
+				}
+				if err != nil && !errors.Is(err, context.Canceled) {
 					select {
 					case errCh <- fmt.Errorf("worker %q: %w", worker.Name(), err):
 					default:
@@ -276,7 +288,10 @@ func (e *Engine) Run(ctx context.Context) error {
 		}
 	}
 	cancel()
-	wg.Wait()
+	if err := waitForWorkers(runningWorkers, e.workerShutdownTimeout); err != nil {
+		log.Error("worker shutdown timeout", "error", err, "timeout", e.workerShutdownTimeout)
+		runErr = errors.Join(runErr, err)
+	}
 
 	if runErr == nil {
 		select {
@@ -285,6 +300,35 @@ func (e *Engine) Run(ctx context.Context) error {
 		}
 	}
 	return runErr
+}
+
+func waitForWorkers(workers []runningWorker, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for _, worker := range workers {
+		select {
+		case <-worker.done:
+		case <-timer.C:
+			names := unfinishedWorkerNames(workers)
+			if len(names) == 0 {
+				return nil
+			}
+			return fmt.Errorf("engine: worker shutdown exceeded %s: %v", timeout, names)
+		}
+	}
+	return nil
+}
+
+func unfinishedWorkerNames(workers []runningWorker) []string {
+	names := make([]string, 0, len(workers))
+	for _, worker := range workers {
+		select {
+		case <-worker.done:
+		default:
+			names = append(names, worker.name)
+		}
+	}
+	return names
 }
 
 func (e *Engine) installInfrastructureRoutes() {

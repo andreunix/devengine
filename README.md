@@ -2,6 +2,9 @@
 
 **devengine** is a Go runtime infrastructure library for building production-ready services. It provides the structural foundation for HTTP servers, background workers, health checks, migrations, and PostgreSQL access — without owning any business domain logic.
 
+English is the primary language for project documentation and public API
+contracts.
+
 ## Overview
 
 The engine deliberately does **not** include domain repositories, authorization rules, or business models. Consuming applications wire their own domain and register it with the engine's runtime surface.
@@ -17,11 +20,11 @@ The engine deliberately does **not** include domain repositories, authorization 
 | `httpx/middleware` | RequestID, logging, panic recovery, security headers |
 | `config` | Environment variable loading |
 | `id` | UUIDv7 generation |
-| `events`, `outbox`, `jobs` | Eventos transacionais e workers at-least-once |
-| `schema` | Snapshot versionado, diff e detecção de drift PostgreSQL |
-| `httpx`, `httpx/clientip`, `httpx/middleware`, `httpx/problem`, `httpx/requestid` | Utilitários HTTP seguros |
-| `telemetry`, `telemetry/otel` | Abstração e adapter opcional OpenTelemetry |
-| `testutil/postgres` | Bancos isolados para testes de integração |
+| `events`, `outbox`, `jobs` | Transactional events and at-least-once workers |
+| `schema` | Versioned PostgreSQL snapshots, diffing, and drift detection |
+| `httpx`, `httpx/clientip`, `httpx/middleware`, `httpx/problem`, `httpx/requestid` | Safe HTTP utilities |
+| `telemetry`, `telemetry/otel` | Telemetry abstraction and optional OpenTelemetry adapter |
+| `testutil/postgres` | Isolated databases for integration tests |
 | `cmd/devengine` | Scaffold CLI for bootstrapping new applications |
 
 ## Migration Version Ranges
@@ -40,14 +43,19 @@ cd my-app && go mod tidy
 go run ./cmd/app
 ```
 
-## Profiles e lifecycle
+## Profiles and lifecycle
 
-`devengine new -profile http`, `devengine new -profile worker` e `devengine new -profile combined` geram, respectivamente, HTTP, worker e ambos. O profile `http` usa `cmd/server`; `worker` e `combined` usam `cmd/app`. O engine inicia módulos e workers registrados e encerra-os por contexto/sinal.
+`devengine new -profile http`, `worker`, and `combined` generate HTTP-only,
+worker-only, and combined applications respectively. The engine starts
+registered modules and workers and shuts them down on context cancellation or
+an operating-system signal. `WithWorkerShutdownTimeout` bounds the wait for a
+non-cooperative worker and reports its name; returning before shutdown is an
+unexpected worker exit.
 
 ```go
 // HTTP-only: engine.New(engine.WithProfile(engine.ProfileHTTP))
 // Worker-only: engine.New(engine.WithProfile(engine.ProfileWorker))
-// Combined (padrão): engine.New()
+// Combined (default): engine.New()
 ```
 
 ```bash
@@ -61,7 +69,7 @@ devengine new -module github.com/acme/service -profile combined
 cd service && go run ./cmd/app
 ```
 
-Use a fronteira transacional com o contexto retornado, para que todos os repositórios compartilhem a mesma transação:
+Use the returned transaction context so every repository shares the same transaction:
 
 ```go
 err := db.WithTransaction(ctx, func(txCtx context.Context, tx pgx.Tx) error {
@@ -70,32 +78,47 @@ err := db.WithTransaction(ctx, func(txCtx context.Context, tx pgx.Tx) error {
 })
 ```
 
-`outbox.Enqueue` e `jobs.Enqueue` devem ser chamados nessa transação. Entrega é at-least-once: handlers precisam ser idempotentes; tokens de lease impedem que um worker stale grave o outcome de um owner novo. Durante handlers ativos, Jobs e Outbox renovam o lease com o respectivo token; `LeaseRenewalInterval` é metade do lease por padrão e pode ser ajustado. Se ownership for perdido, renovações param e o contexto do handler é cancelado.
-No outbox, `outbox_messages.max_attempts` é a autoridade por mensagem para retries.
+Transaction callbacks may be retried and must not perform external side
+effects. Persist intent through Jobs or Outbox instead. Use
+`WithTransactionOptions` for explicit `pgx.TxOptions`; see
+[`docs/transactions.md`](docs/transactions.md).
+
+Call `outbox.Enqueue` and `jobs.Enqueue` inside that transaction. Delivery is
+at least once, so handlers must be idempotent. Lease tokens prevent a stale
+worker from recording an outcome owned by a newer worker. Losing ownership
+stops renewal and cancels the handler context. Each Outbox message owns its
+retry limit through `max_attempts`.
 
 ```go
-// Dentro de db.WithTransaction: evento e alteração de domínio são atômicos.
-err := outbox.Enqueue(txCtx, tx, events.Event{ID: "evt_1", Type: "UserCreated", OccurredAt: time.Now()}, "")
+// Inside WithTransaction, the domain change and event are atomic.
+err := outbox.Enqueue(txCtx, tx, events.Event{ID: "evt_1", Type: "UserCreated", OccurredAt: time.Now()})
 err = jobs.Enqueue(txCtx, tx, jobs.Job{Name: "send_email", Payload: map[string]string{"to": email}})
 
-// Workers usam pools e registries fornecidos pela aplicação.
+// Workers use pools and registries supplied by the application.
 relay := &outbox.Relay{Pool: db.Pool(), Registry: eventRegistry}
 worker := &jobs.Worker{Pool: db.Pool(), Registry: jobRegistry}
 ```
 
 ```go
-// Readiness crítica bloqueia /readyz; checks informativos apenas aparecem no diagnóstico.
+// Critical readiness blocks /readyz; informational checks are diagnostic only.
 ready := health.NewRegistry()
 ready.Add("postgres", db.ReadyCheck())
 ready.AddInformational("cache", cache.ReadyCheck)
+ready.SetTelemetry(adapter.Meter())
+snapshot := ready.Snapshot() // latest programmatic results
 ```
 
-## Banco, migrations e schema
+## Database, migrations, and schema
 
-Migrations da engine usam versões `1–999`; a aplicação usa `1000+`. Todo deploy deve executar primeiro as fontes da engine e depois as fontes da aplicação — `Schema` de jobs/outbox serve apenas para bootstrap efêmero/testes, não para upgrades.
+Engine migrations use versions `1–999`; applications use `1000+`. Deployments
+apply selected engine capability sources before application sources. Jobs and
+Outbox `Schema` constants are only for ephemeral test bootstrapping, not
+production upgrades.
 
 ```go
-sources := append(migrate.EngineSources(), migrate.Source{Kind: migrate.AppSource, FS: appMigrations})
+sources := append([]migrate.Source{}, jobs.Migrations()...)
+sources = append(sources, outbox.Migrations()...)
+sources = append(sources, migrate.Source{Kind: migrate.AppSource, FS: appMigrations})
 err := (migrate.Runner{Pool: db.Pool(), Sources: sources}).Apply(ctx)
 ```
 
@@ -104,37 +127,54 @@ export TEST_DATABASE_URL='postgres://localhost:5432/postgres?sslmode=disable'
 go test -race -count=1 ./...
 ```
 
-`schema.Capture` produz snapshots `snapshot_version: 2`; `schema.Diff` reporta drift de tabelas, enums e sequences, incluindo configuração de sequence. Snapshots v1 continuam legíveis e, para sequences, são comparados apenas por nome: adições e remoções são detectadas, mas metadata que não existia no formato v1 não gera falso `sequence_changed`.
+`schema.Capture` produces `snapshot_version: 2`; `schema.Diff` reports drift in
+tables, enums, and sequences. Version 1 snapshots remain readable. Sequence
+additions and removals are detected by name without inventing changes for
+metadata that did not exist in v1.
 
-## Telemetria
+## Telemetry
 
-Telemetry é noop por padrão. A aplicação configura providers/exporters/propagadores (incluindo W3C Trace Context) e injeta o adapter, sem exporter ou vendor implícito:
+Telemetry is a no-op by default. The application owns providers, exporters,
+resources, and propagators, then injects the adapter explicitly:
 
 ```go
 adapter := devotel.New(tracerProvider, meterProvider)
 app := engine.New(engine.WithTelemetry(adapter.Tracer(), adapter.Meter()))
 ```
 
-Para propagar W3C Trace Context no HTTP, passe explicitamente o propagador da aplicação. Sem essa opção o middleware não lê nem escreve `traceparent`/`tracestate`.
+Pass the application's propagator explicitly for W3C Trace Context. Without it,
+the middleware neither reads nor writes `traceparent` or `tracestate`.
 
 ```go
 handler := middleware.Telemetry(adapter.Tracer(), adapter.Meter(),
   middleware.WithPropagator(propagation.TraceContext{}),
 )(appHandler)
 
-// Em chamadas de saída (ou para expor o contexto na resposta):
+// For outbound calls (or exposing context in a response):
 middleware.InjectTraceContext(ctx, request.Header, propagation.TraceContext{})
 ```
 
-`jobs` é uma fila persistente de jobs atrasáveis, com retry; não é um scheduler cron ou de recorrência.
+`jobs` is a persistent delayed queue with retries, not a cron or recurring-task
+scheduler.
 
-## Módulo privado
+## Private module access
 
-Enquanto privado, configure `GOPRIVATE=github.com/andreunix/*` e credenciais GitHub (SSH ou token) tanto localmente quanto no CI antes de executar `go get`/`go mod download`.
+While the module is private, configure `GOPRIVATE=github.com/andreunix/*` and
+GitHub credentials locally and in CI before `go get` or `go mod download`.
 
 ## CI
 
-The project uses GitHub Actions with `gofmt`, `go vet ./...`, and `go test -race ./...` on every push and pull request. Supported PostgreSQL versions: **17 and 18**. Baseline: **Go 1.27**.
+The project uses GitHub Actions with module hygiene, `gofmt`, `go vet`, race
+tests, vulnerability scanning, API compatibility checks, and PostgreSQL 17/18
+integration tests. Baseline: **Go 1.27**.
+
+Runnable, compile-checked examples live under [`examples/`](examples). Version
+stability, platform support, and the release process are documented in
+[`docs/versioning.md`](docs/versioning.md),
+[`docs/compatibility.md`](docs/compatibility.md), and
+[`docs/releasing.md`](docs/releasing.md). Repository rulesets and GitHub secret
+scanning remain administrator-managed settings; see the release guide for the
+required controls.
 
 ## License
 

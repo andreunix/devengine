@@ -5,6 +5,7 @@ package otel
 import (
 	"context"
 	"fmt"
+
 	"github.com/andreunix/devengine/telemetry"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -31,7 +32,8 @@ func (t tracer) Start(ctx context.Context, name string) (context.Context, teleme
 
 type span struct{ inner oteltrace.Span }
 
-func (s span) End() { s.inner.End() }
+func (s span) End()                { s.inner.End() }
+func (s span) SetName(name string) { s.inner.SetName(name) }
 func (s span) RecordError(e error) {
 	if e != nil {
 		s.inner.RecordError(e)
@@ -81,9 +83,25 @@ func (m meterAdapter) Float64Histogram(n string) telemetry.Histogram {
 	return histogram{h}
 }
 
+// Int64UpDownCounter is available to integrations that need a signed current
+// value, such as health checks in flight, without expanding telemetry.Meter.
+func (m meterAdapter) Int64UpDownCounter(n string) telemetry.Counter {
+	c, e := m.inner.Int64UpDownCounter(n)
+	if e != nil {
+		return telemetry.NoopMeter.Int64Counter(n)
+	}
+	return upDownCounter{c}
+}
+
 type counter struct{ inner metric.Int64Counter }
 
 func (c counter) Add(ctx context.Context, v int64, a map[string]string) {
+	c.inner.Add(ctx, v, metric.WithAttributes(attrs(a)...))
+}
+
+type upDownCounter struct{ inner metric.Int64UpDownCounter }
+
+func (c upDownCounter) Add(ctx context.Context, v int64, a map[string]string) {
 	c.inner.Add(ctx, v, metric.WithAttributes(attrs(a)...))
 }
 

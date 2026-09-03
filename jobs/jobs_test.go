@@ -95,12 +95,14 @@ func TestJobsExecution(t *testing.T) {
 	registry := jobs.NewRegistry()
 	handled := make(chan string, 1)
 
-	registry.Register("send_email", jobs.HandlerFunc(func(ctx context.Context, payload []byte) error {
+	if err := registry.Register("send_email", jobs.HandlerFunc(func(ctx context.Context, payload []byte) error {
 		var p map[string]string
 		_ = json.Unmarshal(payload, &p)
 		handled <- p["email"]
 		return nil
-	}))
+	})); err != nil {
+		t.Fatal(err)
+	}
 
 	worker := &jobs.Worker{
 		Pool:     db.Pool(),
@@ -175,10 +177,12 @@ func TestJobsRetry(t *testing.T) {
 	registry := jobs.NewRegistry()
 	var attempts atomic.Int32
 
-	registry.Register("failing_job", jobs.HandlerFunc(func(ctx context.Context, payload []byte) error {
+	if err := registry.Register("failing_job", jobs.HandlerFunc(func(ctx context.Context, payload []byte) error {
 		attempts.Add(1)
 		return errors.New("temporary failure")
-	}))
+	})); err != nil {
+		t.Fatal(err)
+	}
 
 	worker := &jobs.Worker{
 		Pool:     db.Pool(),

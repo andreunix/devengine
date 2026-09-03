@@ -54,6 +54,17 @@ func WithShutdownTimeout(timeout time.Duration) Option {
 	}
 }
 
+// WithWorkerShutdownTimeout limits how long Run waits for workers to return
+// after their context is cancelled. Workers that exceed the timeout are
+// identified in the returned error and logs; their goroutines are not killed.
+func WithWorkerShutdownTimeout(timeout time.Duration) Option {
+	return func(e *Engine) {
+		if timeout > 0 {
+			e.workerShutdownTimeout = timeout
+		}
+	}
+}
+
 func WithServerTimeouts(readHeader, read, write, idle time.Duration) Option {
 	return func(e *Engine) {
 		e.serverTimeouts = serverTimeouts{

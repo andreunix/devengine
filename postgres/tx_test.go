@@ -3,10 +3,13 @@ package postgres_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/andreunix/devengine/postgres"
 	testpostgres "github.com/andreunix/devengine/testutil/postgres"
 	"github.com/jackc/pgx/v5"
 )
@@ -86,7 +89,7 @@ func TestWithTransactionSavepoint(t *testing.T) {
 
 		// Nested transaction (savepoint) that will be rolled back
 		expectedErr := errors.New("nested error")
-		nestedErr := db.WithTransaction(txCtx, func(nestedCtx context.Context, nestedTx pgx.Tx) error {
+		nestedErr := db.WithTransactionOptions(txCtx, pgx.TxOptions{}, func(nestedCtx context.Context, nestedTx pgx.Tx) error {
 			_, err := db.Querier(nestedCtx).Exec(nestedCtx, `INSERT INTO tx_test (id, val) VALUES (4, 'D')`)
 			if err != nil {
 				return err
@@ -127,6 +130,102 @@ func TestWithTransactionContextCancellation(t *testing.T) {
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Expected context.Canceled, got %v", err)
+	}
+}
+
+func TestWithTransactionDoesNotRetryContextCancellation(t *testing.T) {
+	db := testpostgres.NewIsolatedDatabase(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var attempts atomic.Int32
+
+	err := db.WithTransaction(ctx, func(txCtx context.Context, tx pgx.Tx) error {
+		attempts.Add(1)
+		cancel()
+		return txCtx.Err()
+	}, postgres.RetryConfig{MaxAttempts: 3})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts = %d, want 1", got)
+	}
+}
+
+func TestWithTransactionOptions(t *testing.T) {
+	db := testpostgres.NewIsolatedDatabase(t)
+	ctx := context.Background()
+
+	err := db.WithTransactionOptions(ctx, pgx.TxOptions{
+		IsoLevel:       pgx.Serializable,
+		AccessMode:     pgx.ReadOnly,
+		DeferrableMode: pgx.Deferrable,
+	}, func(txCtx context.Context, tx pgx.Tx) error {
+		var isolation, readOnly, deferrable string
+		if err := tx.QueryRow(txCtx, "SHOW transaction_isolation").Scan(&isolation); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(txCtx, "SHOW transaction_read_only").Scan(&readOnly); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(txCtx, "SHOW transaction_deferrable").Scan(&deferrable); err != nil {
+			return err
+		}
+		if isolation != "serializable" || readOnly != "on" || deferrable != "on" {
+			return fmt.Errorf("transaction settings = %q, %q, %q", isolation, readOnly, deferrable)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WithTransactionOptions failed: %v", err)
+	}
+}
+
+func TestWithTransactionOptionsPreservesNestedSavepoints(t *testing.T) {
+	db := testpostgres.NewIsolatedDatabase(t)
+	ctx := context.Background()
+	if _, err := db.Pool().Exec(ctx, `CREATE TABLE tx_options_savepoint (id INT PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+
+	err := db.WithTransactionOptions(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable}, func(txCtx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(txCtx, `INSERT INTO tx_options_savepoint(id) VALUES (1)`); err != nil {
+			return err
+		}
+		nestedErr := db.WithTransaction(txCtx, func(nestedCtx context.Context, nestedTx pgx.Tx) error {
+			if _, err := nestedTx.Exec(nestedCtx, `INSERT INTO tx_options_savepoint(id) VALUES (2)`); err != nil {
+				return err
+			}
+			return errors.New("rollback nested savepoint")
+		})
+		if nestedErr == nil {
+			return errors.New("expected nested savepoint error")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("outer transaction failed: %v", err)
+	}
+
+	var count int
+	if err := db.Pool().QueryRow(ctx, `SELECT count(*) FROM tx_options_savepoint`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("rows after nested rollback = %d, want 1", count)
+	}
+}
+
+func TestWithTransactionOptionsRejectsOptionsForAmbientTransaction(t *testing.T) {
+	db := testpostgres.NewIsolatedDatabase(t)
+	err := db.WithTransaction(context.Background(), func(txCtx context.Context, tx pgx.Tx) error {
+		return db.WithTransactionOptions(txCtx, pgx.TxOptions{IsoLevel: pgx.Serializable}, func(context.Context, pgx.Tx) error {
+			t.Fatal("callback must not run when options cannot apply to ambient transaction")
+			return nil
+		})
+	})
+	if err == nil || !strings.Contains(err.Error(), "ambient transaction") {
+		t.Fatalf("expected ambient transaction options error, got %v", err)
 	}
 }
 

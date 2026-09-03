@@ -27,8 +27,12 @@ import (
 //go:embed migrations/*.up.sql
 var engineMigrations embed.FS
 
-// EngineSources returns the official migrations for devengine-owned tables.
-// Pass these before application sources to Runner.
+// EngineSources returns the aggregate migrations for all devengine-owned
+// persistent capabilities. Pass these before application sources to Runner.
+//
+// Deprecated: use jobs.Migrations and/or outbox.Migrations to install only the
+// capabilities a service uses. EngineSources remains for compatibility with
+// applications that intentionally install both tables.
 func EngineSources() []Source {
 	return []Source{{Kind: EngineSource, FS: engineMigrations, Dir: "migrations"}}
 }

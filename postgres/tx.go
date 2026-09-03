@@ -15,6 +15,12 @@ import (
 type txKey struct{}
 
 // RetryConfig controls how WithTransaction retries on transient SQLSTATE errors.
+//
+// A callback passed to WithTransaction can run more than once. It must not
+// perform external side effects such as sending email, publishing a webhook, or
+// acknowledging a message broker. Persist an outbox message or a delayed job in
+// the transaction instead, and let its handler perform the external action
+// after commit.
 type RetryConfig struct {
 	// MaxAttempts is the total number of attempts (including the first).
 	// Zero or negative means no retry (single attempt).
@@ -37,7 +43,8 @@ var defaultRetryConfig = RetryConfig{
 	MaxBackoff:     500 * time.Millisecond,
 }
 
-// WithTransaction executes fn inside a pgx transaction. If ctx already carries
+// WithTransaction executes fn inside a pgx transaction using default pgx
+// transaction options. If ctx already carries
 // an ambient transaction (via WithTransaction or InjectTx), fn is called within
 // a savepoint instead of a new top-level transaction, implementing nested
 // transaction semantics.
@@ -55,11 +62,30 @@ var defaultRetryConfig = RetryConfig{
 //	})
 //
 // Transient errors whose SQLSTATE matches cfg.RetryOn cause automatic retry up
-// to cfg.MaxAttempts times with exponential jitter backoff.
+// to cfg.MaxAttempts times with exponential jitter backoff. Consequently fn is
+// retryable code: it must not perform external side effects. Store an outbox
+// message or a jobs.Job in tx and let the Outbox/Jobs worker run that side
+// effect after the transaction commits.
 //
 // Non-transient errors, context cancellation, and business errors are never
 // retried. If fn returns nil, the transaction (or savepoint) is committed.
 func (db *DB) WithTransaction(ctx context.Context, fn func(context.Context, pgx.Tx) error, cfgs ...RetryConfig) error {
+	return db.withTransaction(ctx, pgx.TxOptions{}, fn, cfgs...)
+}
+
+// WithTransactionOptions executes fn using txOptions for a new top-level pgx
+// transaction. Its retry and side-effect contract is identical to
+// WithTransaction.
+//
+// PostgreSQL transaction options are fixed when the outer transaction begins.
+// Therefore, when ctx has an ambient transaction, zero txOptions uses a
+// savepoint and non-zero txOptions returns an error rather than silently
+// ignoring the requested isolation/access/deferrable modes.
+func (db *DB) WithTransactionOptions(ctx context.Context, txOptions pgx.TxOptions, fn func(context.Context, pgx.Tx) error, cfgs ...RetryConfig) error {
+	return db.withTransaction(ctx, txOptions, fn, cfgs...)
+}
+
+func (db *DB) withTransaction(ctx context.Context, txOptions pgx.TxOptions, fn func(context.Context, pgx.Tx) error, cfgs ...RetryConfig) error {
 	cfg := defaultRetryConfig
 	if len(cfgs) > 0 {
 		cfg = cfgs[0]
@@ -79,6 +105,9 @@ func (db *DB) WithTransaction(ctx context.Context, fn func(context.Context, pgx.
 
 	// If there's an ambient transaction in ctx, use a savepoint.
 	if tx, ok := ctx.Value(txKey{}).(pgx.Tx); ok && tx != nil {
+		if txOptions != (pgx.TxOptions{}) {
+			return errors.New("postgres: transaction options cannot be applied to an ambient transaction")
+		}
 		return withSavepoint(ctx, tx, fn)
 	}
 
@@ -88,7 +117,7 @@ func (db *DB) WithTransaction(ctx context.Context, fn func(context.Context, pgx.
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		lastErr = db.runInTx(ctx, fn)
+		lastErr = db.runInTx(ctx, txOptions, fn)
 		if lastErr == nil {
 			return nil
 		}
@@ -126,8 +155,8 @@ func InjectTx(ctx context.Context, tx pgx.Tx) context.Context {
 }
 
 // runInTx opens a transaction, calls fn, and commits or rolls back.
-func (db *DB) runInTx(ctx context.Context, fn func(context.Context, pgx.Tx) error) error {
-	tx, err := db.pool.Begin(ctx)
+func (db *DB) runInTx(ctx context.Context, txOptions pgx.TxOptions, fn func(context.Context, pgx.Tx) error) error {
+	tx, err := db.pool.BeginTx(ctx, txOptions)
 	if err != nil {
 		return fmt.Errorf("postgres: begin transaction: %w", err)
 	}

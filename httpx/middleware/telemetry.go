@@ -3,7 +3,9 @@ package middleware
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/andreunix/devengine/httpx/requestid"
@@ -41,8 +43,8 @@ func Telemetry(tracer telemetry.Tracer, meter telemetry.Meter, options ...Teleme
 		}
 	}
 
-	reqCounter := meter.Int64Counter("http.server.requests")
-	reqLatency := meter.Float64Histogram("http.server.latency")
+	reqCounter := meter.Int64Counter("http.server.request.count")
+	reqLatency := meter.Float64Histogram("http.server.request.duration")
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -50,11 +52,14 @@ func Telemetry(tracer telemetry.Tracer, meter telemetry.Meter, options ...Teleme
 			if config.propagator != nil {
 				ctx = config.propagator.Extract(ctx, propagation.HeaderCarrier(r.Header))
 			}
-			ctx, span := tracer.Start(ctx, fmt.Sprintf("%s %s", r.Method, r.URL.Path))
+			ctx, span := tracer.Start(ctx, r.Method)
 			defer span.End()
 
-			span.SetAttribute("http.method", r.Method)
-			span.SetAttribute("http.url", r.URL.String())
+			span.SetAttribute("http.request.method", r.Method)
+			span.SetAttribute("url.path", r.URL.Path)
+			if address := serverAddress(r.Host); address != "" {
+				span.SetAttribute("server.address", address)
+			}
 
 			if reqID := requestid.FromContext(ctx); reqID != "" {
 				span.SetAttribute("http.request_id", reqID)
@@ -63,7 +68,15 @@ func Telemetry(tracer telemetry.Tracer, meter telemetry.Meter, options ...Teleme
 			start := time.Now()
 			writer := &statusWriter{ResponseWriter: w}
 
-			next.ServeHTTP(writer, r.WithContext(ctx))
+			r = r.WithContext(ctx)
+			next.ServeHTTP(writer, r)
+			route := routePattern(r)
+			if route != "" {
+				span.SetAttribute("http.route", route)
+				if named, ok := span.(interface{ SetName(string) }); ok {
+					named.SetName(httpSpanName(r.Method, route))
+				}
+			}
 
 			if writer.status == 0 {
 				writer.status = http.StatusOK
@@ -71,16 +84,51 @@ func Telemetry(tracer telemetry.Tracer, meter telemetry.Meter, options ...Teleme
 
 			duration := time.Since(start).Seconds()
 
-			span.SetAttribute("http.status_code", writer.status)
+			span.SetAttribute("http.response.status_code", writer.status)
 
 			attrs := map[string]string{
-				"method": r.Method,
-				"status": fmt.Sprintf("%d", writer.status),
+				"http.request.method":       r.Method,
+				"http.response.status_code": fmt.Sprintf("%d", writer.status),
+			}
+			if route != "" {
+				attrs["http.route"] = route
 			}
 			reqCounter.Add(ctx, 1, attrs)
 			reqLatency.Record(ctx, duration, attrs)
 		})
 	}
+}
+
+func routePattern(r *http.Request) string {
+	pattern := strings.TrimSpace(r.Pattern)
+	if pattern == "" {
+		return ""
+	}
+	if strings.HasPrefix(pattern, r.Method+" ") {
+		pattern = strings.TrimSpace(strings.TrimPrefix(pattern, r.Method+" "))
+	}
+	if slash := strings.IndexByte(pattern, '/'); slash >= 0 {
+		return pattern[slash:]
+	}
+	return pattern
+}
+
+func httpSpanName(method, route string) string {
+	if route == "" {
+		return method
+	}
+	return method + " " + route
+}
+
+func serverAddress(hostport string) string {
+	hostport = strings.TrimSpace(hostport)
+	if hostport == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(hostport); err == nil {
+		return host
+	}
+	return strings.Trim(hostport, "[]")
 }
 
 // InjectTraceContext injects the trace context into headers for an outbound

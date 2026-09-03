@@ -28,6 +28,7 @@ import (
 	"math/rand/v2"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/andreunix/devengine/events"
 	"github.com/andreunix/devengine/id"
@@ -38,13 +39,13 @@ import (
 )
 
 const (
-	defaultTable        = "outbox_messages"
 	defaultBatchSize    = 50
 	defaultPollInterval = 2 * time.Second
+	defaultMaxAttempts  = 5
 )
 
 // Schema bootstraps the outbox table for ephemeral tests only. Production
-// deployments must apply migrate.EngineSources() for upgrade-safe evolution.
+// deployments must apply outbox.Migrations() for upgrade-safe evolution.
 const Schema = `CREATE TABLE IF NOT EXISTS outbox_messages (
 	id            TEXT        PRIMARY KEY,
 	event_type    TEXT        NOT NULL,
@@ -66,8 +67,6 @@ const Schema = `CREATE TABLE IF NOT EXISTS outbox_messages (
 
 // RelayConfig configures the Relay worker.
 type RelayConfig struct {
-	// Table overrides the default "outbox_messages" table name.
-	Table string
 	// BatchSize is the number of messages fetched per poll cycle.
 	BatchSize int
 	// PollInterval is how often the relay checks for pending messages.
@@ -80,13 +79,6 @@ type RelayConfig struct {
 	// lease. Zero renews at half LeaseDuration. Values at or above the lease
 	// duration are clamped to half the lease to prevent expiry before renewal.
 	LeaseRenewalInterval time.Duration
-}
-
-func (c *RelayConfig) table() string {
-	if c.Table != "" {
-		return c.Table
-	}
-	return defaultTable
 }
 
 func (c *RelayConfig) batchSize() int {
@@ -128,20 +120,59 @@ func (c *RelayConfig) leaseRenewalInterval() time.Duration {
 	return interval
 }
 
-// Enqueue writes event into the outbox table within tx. It must be called
-// inside the same transaction as the domain change to guarantee atomicity.
-func Enqueue(ctx context.Context, tx pgx.Tx, event events.Event, table string) error {
-	if table == "" {
-		table = defaultTable
+type enqueueConfig struct {
+	maxAttempts  int
+	processAfter time.Time
+}
+
+// EnqueueOption configures persistence of a single outbox message.
+type EnqueueOption func(*enqueueConfig) error
+
+// WithMaxAttempts sets the message-owned retry limit.
+func WithMaxAttempts(maxAttempts int) EnqueueOption {
+	return func(config *enqueueConfig) error {
+		if maxAttempts <= 0 {
+			return errors.New("outbox: max attempts must be greater than zero")
+		}
+		config.maxAttempts = maxAttempts
+		return nil
+	}
+}
+
+// WithProcessAfter delays delivery until the given time.
+func WithProcessAfter(processAfter time.Time) EnqueueOption {
+	return func(config *enqueueConfig) error {
+		if processAfter.IsZero() {
+			return errors.New("outbox: process after must not be zero")
+		}
+		config.processAfter = processAfter
+		return nil
+	}
+}
+
+// Enqueue writes event into the official outbox_messages table within tx. It
+// must be called inside the same transaction as the domain change.
+func Enqueue(ctx context.Context, tx pgx.Tx, event events.Event, options ...EnqueueOption) error {
+	config := enqueueConfig{maxAttempts: defaultMaxAttempts, processAfter: time.Now()}
+	for _, option := range options {
+		if option == nil {
+			continue
+		}
+		if err := option(&config); err != nil {
+			return err
+		}
 	}
 	payload, err := json.Marshal(event.Payload)
 	if err != nil {
 		return fmt.Errorf("outbox: marshal payload: %w", err)
 	}
-	_, err = tx.Exec(ctx, fmt.Sprintf(`
-		INSERT INTO %s (id, event_type, aggregate_id, aggregate_type, payload, schema_version, occurred_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`, table),
+	_, err = tx.Exec(ctx, `
+		INSERT INTO outbox_messages (
+			id, event_type, aggregate_id, aggregate_type, payload, schema_version,
+			occurred_at, max_attempts, process_after
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`,
 		event.ID,
 		event.Type,
 		event.AggregateID,
@@ -149,6 +180,8 @@ func Enqueue(ctx context.Context, tx pgx.Tx, event events.Event, table string) e
 		payload,
 		event.SchemaVersion,
 		event.OccurredAt,
+		config.maxAttempts,
+		config.processAfter,
 	)
 	if err != nil {
 		return fmt.Errorf("outbox: enqueue %s: %w", event.Type, err)
@@ -178,6 +211,7 @@ func (r *Relay) Run(ctx context.Context) error {
 	if r.Registry == nil {
 		return errors.New("outbox: relay registry is required")
 	}
+	r.Registry.Freeze()
 	logger := r.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -220,18 +254,17 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 	ctx, span := r.Tracer.Start(ctx, "outbox.processBatch")
 	defer span.End()
 
-	table := r.Config.table()
 	batch := r.Config.batchSize()
 	leaseDuration := r.Config.leaseDuration()
 	claimPrefix := id.MustUUIDv7()
 
 	// Claim messages and lease them so other workers don't pick them up.
-	rows, err := r.Pool.Query(ctx, fmt.Sprintf(`
-		UPDATE %s
+	rows, err := r.Pool.Query(ctx, `
+		UPDATE outbox_messages
 		SET process_after = NOW() + $2::interval, locked_until = NOW() + $2::interval, claim_token = $3 || ':' || id
 		WHERE id IN (
 			SELECT id
-			FROM %s
+			FROM outbox_messages
 			WHERE processed_at IS NULL
 			  AND failed_at IS NULL
 			  AND process_after <= NOW()
@@ -241,7 +274,7 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 			FOR UPDATE SKIP LOCKED
 		)
 		RETURNING id, event_type, aggregate_id, aggregate_type, payload, schema_version, occurred_at, attempt, max_attempts, claim_token
-	`, table, table), batch, postgresInterval(leaseDuration), claimPrefix)
+	`, batch, postgresInterval(leaseDuration), claimPrefix)
 	if err != nil {
 		return fmt.Errorf("outbox: claim batch: %w", err)
 	}
@@ -272,7 +305,7 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 			OccurredAt:    m.occurredAt,
 		}
 
-		handlerCtx, stopRenewal := r.startLeaseRenewal(ctx, logger, table, m, leaseDuration)
+		handlerCtx, stopRenewal := r.startLeaseRenewal(ctx, logger, m, leaseDuration)
 		evCtx, evSpan := r.Tracer.Start(handlerCtx, "outbox.deliver")
 		evSpan.SetAttribute("event.id", m.id)
 		evSpan.SetAttribute("event.type", m.eventType)
@@ -288,27 +321,25 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 		var tag pgconn.CommandTag
 
 		if deliveryErr == nil {
-			tag, err = r.Pool.Exec(ctx, fmt.Sprintf(`
-				UPDATE %s SET processed_at = NOW() WHERE id = $1 AND claim_token = $2
-			`, table), m.id, m.claimToken)
+			tag, err = r.Pool.Exec(ctx, `
+				UPDATE outbox_messages SET processed_at = NOW() WHERE id = $1 AND claim_token = $2
+			`, m.id, m.claimToken)
 		} else {
 			errMsg := deliveryErr.Error()
-			if len(errMsg) > 1024 {
-				errMsg = errMsg[:1024]
-			}
+			errMsg = truncateUTF8(errMsg, 1024)
 			if nextAttempt >= m.maxAttempts {
 				logger.Error("outbox: message failed permanently",
 					"id", m.id, "type", m.eventType, "attempts", nextAttempt, "error", deliveryErr)
-				tag, err = r.Pool.Exec(ctx, fmt.Sprintf(`
-					UPDATE %s SET failed_at = NOW(), attempt = $2, last_error = $3 WHERE id = $1 AND claim_token = $4
-				`, table), m.id, nextAttempt, errMsg, m.claimToken)
+				tag, err = r.Pool.Exec(ctx, `
+					UPDATE outbox_messages SET failed_at = NOW(), attempt = $2, last_error = $3 WHERE id = $1 AND claim_token = $4
+				`, m.id, nextAttempt, errMsg, m.claimToken)
 			} else {
 				backoff := r.backoff(nextAttempt)
 				logger.Warn("outbox: delivery failed, will retry",
 					"id", m.id, "type", m.eventType, "attempt", nextAttempt, "retry_after", backoff)
-				tag, err = r.Pool.Exec(ctx, fmt.Sprintf(`
-					UPDATE %s SET attempt = $2, process_after = NOW() + $3::interval, locked_until = NULL, claim_token = NULL, last_error = $4 WHERE id = $1 AND claim_token = $5
-				`, table), m.id, nextAttempt,
+				tag, err = r.Pool.Exec(ctx, `
+					UPDATE outbox_messages SET attempt = $2, process_after = NOW() + $3::interval, locked_until = NULL, claim_token = NULL, last_error = $4 WHERE id = $1 AND claim_token = $5
+				`, m.id, nextAttempt,
 					fmt.Sprintf("%d milliseconds", int(backoff.Milliseconds())),
 					errMsg, m.claimToken)
 			}
@@ -337,7 +368,18 @@ func (r *Relay) processBatch(ctx context.Context, logger *slog.Logger) error {
 	return nil
 }
 
-func (r *Relay) startLeaseRenewal(parent context.Context, logger *slog.Logger, table string, message outboxRow, lease time.Duration) (context.Context, func()) {
+func truncateUTF8(value string, maxBytes int) string {
+	if len(value) <= maxBytes {
+		return value
+	}
+	value = value[:maxBytes]
+	for !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
+}
+
+func (r *Relay) startLeaseRenewal(parent context.Context, logger *slog.Logger, message outboxRow, lease time.Duration) (context.Context, func()) {
 	handlerCtx, cancelHandler := context.WithCancel(parent)
 	renewalCtx, cancelRenewal := context.WithCancel(parent)
 	done := make(chan struct{})
@@ -359,12 +401,12 @@ func (r *Relay) startLeaseRenewal(parent context.Context, logger *slog.Logger, t
 			case <-renewalCtx.Done():
 				return
 			case <-ticker.C:
-				tag, err := r.Pool.Exec(renewalCtx, fmt.Sprintf(`
-					UPDATE %s
+				tag, err := r.Pool.Exec(renewalCtx, `
+					UPDATE outbox_messages
 					SET process_after = NOW() + $3::interval,
 					    locked_until = NOW() + $3::interval
 					WHERE id = $1 AND claim_token = $2 AND locked_until > NOW()
-				`, table), message.id, message.claimToken, postgresInterval(lease))
+				`, message.id, message.claimToken, postgresInterval(lease))
 				if err != nil {
 					if !errors.Is(err, context.Canceled) {
 						logger.Warn("outbox: lease renewal failed", "id", message.id, "error", err)
@@ -396,11 +438,20 @@ func (r *Relay) deliver(ctx context.Context, event events.Event) error {
 	}
 	var errs []error
 	for _, h := range handlers {
-		if err := h.Handle(ctx, event); err != nil {
+		if err := callEventHandler(ctx, h, event); err != nil {
 			errs = append(errs, fmt.Errorf("handler %T: %w", h, err))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func callEventHandler(ctx context.Context, handler events.Handler, event events.Event) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("outbox: handler panic: %v", recovered)
+		}
+	}()
+	return handler.Handle(ctx, event)
 }
 
 // backoff returns an exponential jitter delay for attempt n (1-indexed).

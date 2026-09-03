@@ -38,10 +38,12 @@ func TestProcessBatchRecordsClaimLost(t *testing.T) {
 		t.Fatal(e)
 	}
 	r := NewRegistry()
-	r.Register("task", HandlerFunc(func(context.Context, []byte) error {
+	if err := r.Register("task", HandlerFunc(func(context.Context, []byte) error {
 		_, e := db.Pool().Exec(ctx, `UPDATE devengine_jobs SET claim_token='new-owner' WHERE id='lost'`)
 		return e
-	}))
+	})); err != nil {
+		t.Fatal(err)
+	}
 	m := &claimMeter{}
 	w := &Worker{Pool: db.Pool(), Registry: r, Meter: m, Tracer: telemetry.NoopTracer}
 	if e := w.processBatch(ctx, slog.Default()); e != nil {
@@ -64,11 +66,13 @@ func TestProcessBatchRenewsLeaseWhileHandlerRuns(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	registry := NewRegistry()
-	registry.Register("task", HandlerFunc(func(context.Context, []byte) error {
+	if err := registry.Register("task", HandlerFunc(func(context.Context, []byte) error {
 		close(started)
 		<-release
 		return nil
-	}))
+	})); err != nil {
+		t.Fatal(err)
+	}
 	config := WorkerConfig{LeaseDuration: 80 * time.Millisecond, LeaseRenewalInterval: 10 * time.Millisecond}
 	worker := &Worker{Pool: db.Pool(), Registry: registry, Config: config, Tracer: telemetry.NoopTracer, Meter: telemetry.NoopMeter}
 	done := make(chan error, 1)
@@ -79,10 +83,12 @@ func TestProcessBatchRenewsLeaseWhileHandlerRuns(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	var secondCalls atomic.Int32
 	secondRegistry := NewRegistry()
-	secondRegistry.Register("task", HandlerFunc(func(context.Context, []byte) error {
+	if err := secondRegistry.Register("task", HandlerFunc(func(context.Context, []byte) error {
 		secondCalls.Add(1)
 		return nil
-	}))
+	})); err != nil {
+		t.Fatal(err)
+	}
 	second := &Worker{Pool: db.Pool(), Registry: secondRegistry, Config: config, Tracer: telemetry.NoopTracer, Meter: telemetry.NoopMeter}
 	if err := second.processBatch(ctx, slog.Default()); err != nil {
 		t.Fatal(err)
@@ -108,12 +114,14 @@ func TestProcessBatchCancelsHandlerAfterLostLease(t *testing.T) {
 	started := make(chan struct{})
 	cancelled := make(chan struct{})
 	registry := NewRegistry()
-	registry.Register("task", HandlerFunc(func(handlerCtx context.Context, _ []byte) error {
+	if err := registry.Register("task", HandlerFunc(func(handlerCtx context.Context, _ []byte) error {
 		close(started)
 		<-handlerCtx.Done()
 		close(cancelled)
 		return handlerCtx.Err()
-	}))
+	})); err != nil {
+		t.Fatal(err)
+	}
 	worker := &Worker{Pool: db.Pool(), Registry: registry, Config: WorkerConfig{LeaseDuration: time.Second, LeaseRenewalInterval: 10 * time.Millisecond}, Tracer: telemetry.NoopTracer, Meter: telemetry.NoopMeter}
 	done := make(chan error, 1)
 	go func() { done <- worker.processBatch(ctx, slog.Default()) }()

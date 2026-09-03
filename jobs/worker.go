@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/andreunix/devengine/id"
 	"github.com/andreunix/devengine/telemetry"
@@ -175,7 +176,7 @@ func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
 		if handler == nil {
 			processErr = fmt.Errorf("no handler for job %q", j.name)
 		} else {
-			processErr = handler.Handle(jobCtx, j.payload)
+			processErr = callHandler(jobCtx, handler, j.payload)
 		}
 		stopRenewal()
 
@@ -191,9 +192,7 @@ func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
 			tag, err = w.Pool.Exec(ctx, `DELETE FROM devengine_jobs WHERE id = $1 AND claim_token = $2`, j.id, j.claimToken)
 		} else {
 			errMsg := processErr.Error()
-			if len(errMsg) > 1024 {
-				errMsg = errMsg[:1024]
-			}
+			errMsg = truncateUTF8(errMsg, 1024)
 			if nextAttempt >= j.maxAttempts {
 				logger.Error("jobs: job failed permanently",
 					"id", j.id, "name", j.name, "attempts", nextAttempt, "error", processErr)
@@ -233,6 +232,26 @@ func (w *Worker) processBatch(ctx context.Context, logger *slog.Logger) error {
 	}
 
 	return nil
+}
+
+func truncateUTF8(value string, maxBytes int) string {
+	if len(value) <= maxBytes {
+		return value
+	}
+	value = value[:maxBytes]
+	for !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
+}
+
+func callHandler(ctx context.Context, handler Handler, payload []byte) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("jobs: handler panic: %v", recovered)
+		}
+	}()
+	return handler.Handle(ctx, payload)
 }
 
 func (w *Worker) startLeaseRenewal(parent context.Context, logger *slog.Logger, job jobRow, lease time.Duration) (context.Context, func()) {

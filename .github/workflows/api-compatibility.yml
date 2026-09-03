@@ -1,0 +1,31 @@
+name: API Compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  api-compatibility:
+    name: API compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.27'
+          cache: true
+      - name: compare with latest tag
+        shell: bash
+        run: |
+          base_tag=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [[ -z "$base_tag" ]]; then
+            echo "No previous tag; API comparison skipped."
+            exit 0
+          fi
+          go run github.com/joelanford/go-apidiff@v0.8.3 "$base_tag"
