@@ -8,6 +8,9 @@
    compatibility against the previous tag.
 4. GitHub Release is created only after every gate succeeds.
 
+The current hardened pre-v1 baseline is `v0.2.0`. New backward-compatible fixes
+use `v0.2.x`; intentional pre-v1 API changes require the next minor version.
+
 Tags are release artifacts and must not be moved or reused. If a release is
 bad, publish a new patch version. GitHub repository administrators must enable
 a ruleset that protects `main`, prevents tag updates/deletions, and requires
