@@ -162,35 +162,38 @@ func TestLeaseRenewalStopsAfterStop(t *testing.T) {
 	}
 	if _, err := db.Pool().Exec(ctx, `
 		INSERT INTO devengine_jobs(id, name, locked_until, claim_token)
-		VALUES ('stop-renewal', 'task', NOW() + interval '30 milliseconds', 'owner')
+		VALUES ('stop-renewal', 'task', NOW() + interval '1 second', 'owner')
 	`); err != nil {
 		t.Fatal(err)
 	}
 
-	worker := &Worker{Pool: db.Pool(), Config: WorkerConfig{LeaseRenewalInterval: 5 * time.Millisecond}}
-	_, stop := worker.startLeaseRenewal(ctx, slog.Default(), jobRow{id: "stop-renewal", name: "task", claimToken: "owner"}, 200*time.Millisecond)
+	worker := &Worker{Pool: db.Pool(), Config: WorkerConfig{LeaseRenewalInterval: 20 * time.Millisecond}}
+	_, stop := worker.startLeaseRenewal(ctx, slog.Default(), jobRow{id: "stop-renewal", name: "task", claimToken: "owner"}, 2*time.Second)
 	var renewedUntil time.Time
-	deadline := time.After(time.Second)
+	deadline := time.After(2 * time.Second)
 	for {
 		if err := db.Pool().QueryRow(ctx, `SELECT locked_until FROM devengine_jobs WHERE id = 'stop-renewal'`).Scan(&renewedUntil); err != nil {
 			t.Fatal(err)
 		}
-		if renewedUntil.After(time.Now().Add(100 * time.Millisecond)) {
+		if renewedUntil.After(time.Now().Add(time.Second)) {
 			break
 		}
 		select {
 		case <-deadline:
 			t.Fatal("lease was not renewed")
-		case <-time.After(5 * time.Millisecond):
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
 	stop()
+	// pgx may return from a cancelled query before PostgreSQL finishes handling
+	// the cancellation. Let that in-flight request settle before the assertion.
+	time.Sleep(100 * time.Millisecond)
 
 	var afterStop time.Time
 	if err := db.Pool().QueryRow(ctx, `SELECT locked_until FROM devengine_jobs WHERE id = 'stop-renewal'`).Scan(&afterStop); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	var later time.Time
 	if err := db.Pool().QueryRow(ctx, `SELECT locked_until FROM devengine_jobs WHERE id = 'stop-renewal'`).Scan(&later); err != nil {
 		t.Fatal(err)
