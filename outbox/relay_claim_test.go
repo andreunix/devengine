@@ -70,13 +70,34 @@ func TestProcessBatchRenewsLeaseWhileHandlerRuns(t *testing.T) {
 		<-release
 		return nil
 	}})
-	config := RelayConfig{LeaseDuration: 80 * time.Millisecond, LeaseRenewalInterval: 10 * time.Millisecond}
+	config := RelayConfig{LeaseDuration: 300 * time.Millisecond, LeaseRenewalInterval: 50 * time.Millisecond}
 	relay := &Relay{Pool: db.Pool(), Registry: registry, Config: config, Tracer: telemetry.NoopTracer, Meter: telemetry.NoopMeter}
 	done := make(chan error, 1)
 	go func() { done <- relay.processBatch(ctx, slog.Default()) }()
 	<-started
 
-	time.Sleep(150 * time.Millisecond)
+	var initialLease time.Time
+	if err := db.Pool().QueryRow(ctx, `SELECT locked_until FROM outbox_messages WHERE id = 'renew'`).Scan(&initialLease); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		var renewedLease time.Time
+		err := db.Pool().QueryRow(ctx, `SELECT locked_until FROM outbox_messages WHERE id = 'renew'`).Scan(&renewedLease)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if renewedLease.After(initialLease) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("lease was not renewed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if wait := time.Until(initialLease.Add(20 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
 	var secondCalls atomic.Int32
 	secondRegistry := events.NewRegistry()
 	secondRegistry.Register(events.HandlerFunc{Type: "event", HandleF: func(context.Context, events.Event) error {

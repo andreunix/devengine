@@ -233,15 +233,22 @@ func TestJobsRetry(t *testing.T) {
 		t.Errorf("expected exactly 2 attempts, got %d", got)
 	}
 
-	// Verify job is marked as failed permanently
+	// The handler increments attempts before the worker persists the outcome.
+	// Wait for the durable state instead of racing the final UPDATE.
 	var lastError string
 	var permanentlyLocked bool
-	err = db.Pool().QueryRow(context.Background(), `
-		SELECT last_error, locked_until = 'infinity'::timestamptz
-		FROM devengine_jobs
-	`).Scan(&lastError, &permanentlyLocked)
-	if err != nil {
-		t.Fatal(err)
+	persistDeadline := time.Now().Add(2 * time.Second)
+	for !permanentlyLocked && time.Now().Before(persistDeadline) {
+		err = db.Pool().QueryRow(context.Background(), `
+			SELECT last_error, locked_until = 'infinity'::timestamptz
+			FROM devengine_jobs
+		`).Scan(&lastError, &permanentlyLocked)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !permanentlyLocked {
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 	if lastError != "temporary failure" {
 		t.Errorf("expected last_error to be 'temporary failure', got %q", lastError)
