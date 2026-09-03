@@ -101,8 +101,12 @@ func TestHealthTelemetryRecordsDurationTimeoutPanicAndInflight(t *testing.T) {
 	if got := meter.counterValue("health_check_panics_total"); got != 1 {
 		t.Fatalf("panics = %d, want 1", got)
 	}
+	deadline := time.Now().Add(time.Second)
+	for meter.counterValue("health_check_inflight") != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	if got := meter.counterValue("health_check_inflight"); got != 0 {
-		t.Fatalf("inflight = %d, want 0", got)
+		t.Fatalf("inflight = %d, want 0 after cooperative checks returned", got)
 	}
 	if got := meter.histogramCount("health_check_duration"); got != 2 {
 		t.Fatalf("duration recordings = %d, want 2", got)
