@@ -48,7 +48,7 @@ jobs:
           docker run --detach --name "$PG_CONTAINER" \
             --cpus 2 --memory 3g --memory-swap 3g \
             --publish "127.0.0.1:${PG_PORT}:5432" \
-            --volume "$PG_VOLUME:/var/lib/postgresql/data" \
+            --volume "$PG_VOLUME:/var/lib/postgresql" \
             --env POSTGRES_USER=devengine \
             --env POSTGRES_PASSWORD=devengine \
             --env POSTGRES_DB=devengine_test \
@@ -56,6 +56,10 @@ jobs:
           for attempt in $(seq 1 60); do
             if docker exec "$PG_CONTAINER" pg_isready -U devengine -d devengine_test; then
               exit 0
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' "$PG_CONTAINER")" != true ]; then
+              docker logs "$PG_CONTAINER"
+              exit 1
             fi
             sleep 1
           done
