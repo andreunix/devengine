@@ -39,3 +39,26 @@ func FuzzFromRequestNeverTrustsUnconfiguredPeer(f *testing.F) {
 		}
 	})
 }
+
+func FuzzResolverForwardedNeverReturnsMalformedAddress(f *testing.F) {
+	f.Add(`for=203.0.113.10, for="[fd00::2]:443"`)
+	f.Add("for=unknown")
+	f.Add(`for="unterminated`)
+	resolver, err := New(
+		[]string{"10.0.0.0/8", "fd00::/8"},
+		[]string{HeaderForwarded},
+	)
+	if err != nil {
+		f.Fatal(err)
+	}
+
+	f.Fuzz(func(t *testing.T, forwarded string) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "10.0.0.1:4321"
+		req.Header.Set(HeaderForwarded, forwarded)
+		got := resolver.Resolve(req)
+		if net.ParseIP(got) == nil {
+			t.Fatalf("Resolver.Resolve returned a non-IP value %q", got)
+		}
+	})
+}

@@ -6,6 +6,18 @@ between stable-candidate and experimental packages until v1.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- A strict, configurable client IP resolver supporting RFC 7239 `Forwarded`,
+  `X-Forwarded-For`, `X-Real-IP`, and `CF-Connecting-IP` behind explicitly
+  trusted proxy CIDRs.
+
+### Deprecated
+
+- `clientip.ParseTrustedProxies`, `MustParseTrustedProxies`, and `FromRequest`;
+  use `clientip.New` and `Resolver.Resolve`. The legacy API remains available
+  throughout the v0.2 release line.
+
 ## [0.2.0] - 2026-09-02
 
 ### Added

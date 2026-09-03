@@ -157,6 +157,31 @@ middleware.InjectTraceContext(ctx, request.Header, propagation.TraceContext{})
 `jobs` is a persistent delayed queue with retries, not a cron or recurring-task
 scheduler.
 
+## Client IP behind trusted proxies
+
+`httpx/clientip` reads forwarding headers only when the direct peer belongs to
+an explicitly trusted CIDR. Header priority is explicit; a malformed selected
+header fails closed to the direct peer.
+
+```go
+resolver, err := clientip.New(
+  []string{"10.0.0.0/8", "fd00::/8"},
+  []string{
+    clientip.HeaderCFConnectingIP,
+    clientip.HeaderForwarded,
+    clientip.HeaderXForwardedFor,
+    clientip.HeaderXRealIP,
+  },
+)
+ip := resolver.Resolve(request)
+```
+
+For a Cloudflare → reverse proxy → service deployment, trust only the network
+used by the reverse proxy to reach the service. Configure the header order to
+match headers that this trusted boundary overwrites. See
+[`docs/client-ip.md`](docs/client-ip.md) and the executable
+[`examples/clientip`](examples/clientip).
+
 ## Private module access
 
 While the module is private, configure `GOPRIVATE=github.com/andreunix/*` and

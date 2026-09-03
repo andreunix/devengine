@@ -1,26 +1,303 @@
-// Package clientip resolves the real client IP address from an HTTP request,
-// respecting a configurable list of trusted proxy CIDRs.
-//
-// Security: X-Forwarded-For and X-Real-IP headers are never trusted
-// unconditionally. Only requests arriving from known trusted proxies have
-// their forwarded-for header examined.
+// Package clientip resolves client IPs without trusting forwarding headers
+// received directly from untrusted peers.
 package clientip
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 )
 
-// TrustedProxies is a set of CIDR ranges whose X-Forwarded-For header is
-// trusted. Use ParseTrustedProxies to construct one from strings.
-type TrustedProxies struct {
-	nets []*net.IPNet
+const (
+	HeaderForwarded      = "Forwarded"
+	HeaderXForwardedFor  = "X-Forwarded-For"
+	HeaderXRealIP        = "X-Real-IP"
+	HeaderCFConnectingIP = "CF-Connecting-IP"
+	maxHeaderBytes       = 8 << 10
+	maxHops              = 32
+)
+
+var supportedHeaders = map[string]string{
+	"forwarded": HeaderForwarded, "x-forwarded-for": HeaderXForwardedFor,
+	"x-real-ip": HeaderXRealIP, "cf-connecting-ip": HeaderCFConnectingIP,
 }
 
-// ParseTrustedProxies parses a list of CIDR strings (e.g. "10.0.0.0/8",
-// "172.16.0.0/12"). It returns an error if any CIDR is invalid.
+// Resolver is an immutable, concurrency-safe client IP resolver.
+type Resolver struct {
+	trusted  []netip.Prefix
+	priority []string
+}
+
+// New constructs a resolver. Header order defines precedence.
+func New(trustedCIDRs, priority []string) (*Resolver, error) {
+	if len(priority) == 0 {
+		return nil, errors.New("clientip: header priority must not be empty")
+	}
+	trusted := make([]netip.Prefix, 0, len(trustedCIDRs))
+	seenPrefixes := make(map[netip.Prefix]struct{}, len(trustedCIDRs))
+	for _, raw := range trustedCIDRs {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil {
+			return nil, fmt.Errorf("clientip: invalid trusted CIDR %q: %w", raw, err)
+		}
+		prefix = prefix.Masked()
+		if _, exists := seenPrefixes[prefix]; exists {
+			return nil, fmt.Errorf("clientip: duplicate trusted CIDR %q", raw)
+		}
+		seenPrefixes[prefix] = struct{}{}
+		trusted = append(trusted, prefix)
+	}
+	headers := make([]string, 0, len(priority))
+	seenHeaders := make(map[string]struct{}, len(priority))
+	for _, raw := range priority {
+		key := strings.ToLower(strings.TrimSpace(raw))
+		header, ok := supportedHeaders[key]
+		if !ok {
+			return nil, fmt.Errorf("clientip: unsupported header %q", raw)
+		}
+		if _, exists := seenHeaders[key]; exists {
+			return nil, fmt.Errorf("clientip: duplicate header %q", raw)
+		}
+		seenHeaders[key] = struct{}{}
+		headers = append(headers, header)
+	}
+	return &Resolver{trusted: trusted, priority: headers}, nil
+}
+
+// Resolve returns the direct peer unless it is trusted and a configured
+// forwarding header contains a fully valid chain. Malformed headers fail
+// closed instead of allowing a lower-priority header to influence the result.
+func (r *Resolver) Resolve(req *http.Request) string {
+	if req == nil {
+		return ""
+	}
+	peer, peerText, ok := parseRemoteAddr(req.RemoteAddr)
+	if !ok || !r.contains(peer) {
+		return peerText
+	}
+	for _, header := range r.priority {
+		values := req.Header.Values(header)
+		if len(values) == 0 {
+			continue
+		}
+		chain, valid := parseHeader(header, values)
+		if !valid {
+			return peerText
+		}
+		for i := len(chain) - 1; i >= 0; i-- {
+			if !r.contains(chain[i]) {
+				return chain[i].String()
+			}
+		}
+		return peerText
+	}
+	return peerText
+}
+
+func (r *Resolver) contains(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	for _, prefix := range r.trusted {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseRemoteAddr(raw string) (netip.Addr, string, bool) {
+	if addrPort, err := netip.ParseAddrPort(raw); err == nil {
+		addr := addrPort.Addr()
+		if addr.Zone() != "" {
+			return netip.Addr{}, "", false
+		}
+		addr = addr.Unmap()
+		return addr, addr.String(), true
+	}
+	addr, err := netip.ParseAddr(raw)
+	if err != nil || addr.Zone() != "" {
+		return netip.Addr{}, "", false
+	}
+	addr = addr.Unmap()
+	return addr, addr.String(), true
+}
+
+func parseHeader(header string, values []string) ([]netip.Addr, bool) {
+	if header == HeaderCFConnectingIP || header == HeaderXRealIP {
+		if len(values) != 1 || strings.Contains(values[0], ",") {
+			return nil, false
+		}
+		addr, ok := parseBareAddr(strings.TrimSpace(values[0]))
+		return []netip.Addr{addr}, ok
+	}
+	if headerBytes(values) > maxHeaderBytes {
+		return nil, false
+	}
+	joined := strings.Join(values, ",")
+	if header == HeaderForwarded {
+		return parseForwarded(joined)
+	}
+	parts := strings.Split(joined, ",")
+	if len(parts) == 0 || len(parts) > maxHops {
+		return nil, false
+	}
+	chain := make([]netip.Addr, 0, len(parts))
+	for _, part := range parts {
+		addr, ok := parseBareAddr(strings.TrimSpace(part))
+		if !ok {
+			return nil, false
+		}
+		chain = append(chain, addr)
+	}
+	return chain, true
+}
+
+func headerBytes(values []string) int {
+	total := 0
+	for _, value := range values {
+		total += len(value)
+	}
+	return total
+}
+
+func parseBareAddr(raw string) (netip.Addr, bool) {
+	if raw == "" || strings.ContainsAny(raw, "[]") {
+		return netip.Addr{}, false
+	}
+	addr, err := netip.ParseAddr(raw)
+	if err != nil || addr.Zone() != "" || addr.IsUnspecified() {
+		return netip.Addr{}, false
+	}
+	return addr.Unmap(), true
+}
+
+func parseForwarded(raw string) ([]netip.Addr, bool) {
+	elements, ok := splitOutsideQuotes(raw, ',')
+	if !ok || len(elements) == 0 || len(elements) > maxHops {
+		return nil, false
+	}
+	chain := make([]netip.Addr, 0, len(elements))
+	for _, element := range elements {
+		params, valid := splitOutsideQuotes(element, ';')
+		if !valid || len(params) == 0 {
+			return nil, false
+		}
+		var addr netip.Addr
+		found := false
+		for _, param := range params {
+			name, value, present := strings.Cut(strings.TrimSpace(param), "=")
+			if !present || strings.TrimSpace(name) == "" || strings.TrimSpace(value) == "" {
+				return nil, false
+			}
+			if strings.EqualFold(strings.TrimSpace(name), "for") {
+				if found {
+					return nil, false
+				}
+				addr, valid = parseForwardedNode(strings.TrimSpace(value))
+				if !valid {
+					return nil, false
+				}
+				found = true
+			}
+		}
+		if !found {
+			return nil, false
+		}
+		chain = append(chain, addr)
+	}
+	return chain, true
+}
+
+func splitOutsideQuotes(raw string, separator byte) ([]string, bool) {
+	var parts []string
+	start, quoted, escaped := 0, false, false
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if c == '\r' || c == '\n' || (c < 0x20 && c != '\t') || c == 0x7f {
+			return nil, false
+		}
+		if escaped {
+			escaped = false
+			continue
+		}
+		if quoted && c == '\\' {
+			escaped = true
+			continue
+		}
+		if c == '"' {
+			quoted = !quoted
+			continue
+		}
+		if c == separator && !quoted {
+			part := strings.TrimSpace(raw[start:i])
+			if part == "" {
+				return nil, false
+			}
+			parts = append(parts, part)
+			start = i + 1
+		}
+	}
+	if quoted || escaped {
+		return nil, false
+	}
+	last := strings.TrimSpace(raw[start:])
+	if last == "" {
+		return nil, false
+	}
+	return append(parts, last), true
+}
+
+func parseForwardedNode(raw string) (netip.Addr, bool) {
+	quoted := len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"'
+	if strings.HasPrefix(raw, "\"") != strings.HasSuffix(raw, "\"") {
+		return netip.Addr{}, false
+	}
+	if quoted {
+		var b strings.Builder
+		for i := 1; i < len(raw)-1; i++ {
+			if raw[i] == '\\' {
+				i++
+				if i >= len(raw)-1 {
+					return netip.Addr{}, false
+				}
+			}
+			b.WriteByte(raw[i])
+		}
+		raw = b.String()
+	}
+	if strings.EqualFold(raw, "unknown") || strings.HasPrefix(raw, "_") || raw == "" {
+		return netip.Addr{}, false
+	}
+	if strings.HasPrefix(raw, "[") {
+		if addrPort, err := netip.ParseAddrPort(raw); err == nil {
+			addr := addrPort.Addr()
+			return addr.Unmap(), addr.Is6() && addr.Zone() == "" && !addr.IsUnspecified()
+		}
+		if !strings.HasSuffix(raw, "]") {
+			return netip.Addr{}, false
+		}
+		addr, err := netip.ParseAddr(strings.TrimSuffix(strings.TrimPrefix(raw, "["), "]"))
+		return addr.Unmap(), err == nil && addr.Is6() && addr.Zone() == "" && !addr.IsUnspecified()
+	}
+	if quoted {
+		if addrPort, err := netip.ParseAddrPort(raw); err == nil {
+			addr := addrPort.Addr()
+			return addr.Unmap(), addr.Is4() && !addr.IsUnspecified()
+		}
+	}
+	addr, ok := parseBareAddr(raw)
+	return addr, ok && addr.Is4()
+}
+
+// TrustedProxies is the legacy trusted proxy representation.
+// Deprecated: use Resolver and New.
+type TrustedProxies struct{ nets []*net.IPNet }
+
+// ParseTrustedProxies parses legacy trusted CIDRs.
+// Deprecated: use New.
 func ParseTrustedProxies(cidrs []string) (TrustedProxies, error) {
 	tp := TrustedProxies{}
 	for _, cidr := range cidrs {
@@ -38,7 +315,7 @@ func ParseTrustedProxies(cidrs []string) (TrustedProxies, error) {
 }
 
 // MustParseTrustedProxies is like ParseTrustedProxies but panics on error.
-// Suitable for package-level initialization with known-good CIDRs.
+// Deprecated: use New.
 func MustParseTrustedProxies(cidrs []string) TrustedProxies {
 	tp, err := ParseTrustedProxies(cidrs)
 	if err != nil {
@@ -47,7 +324,8 @@ func MustParseTrustedProxies(cidrs []string) TrustedProxies {
 	return tp
 }
 
-// Contains reports whether ip is within any of the trusted ranges.
+// Contains reports whether ip is trusted.
+// Deprecated: use Resolver.Resolve.
 func (tp TrustedProxies) Contains(ip net.IP) bool {
 	for _, network := range tp.nets {
 		if network.Contains(ip) {
@@ -57,67 +335,45 @@ func (tp TrustedProxies) Contains(ip net.IP) bool {
 	return false
 }
 
-// FromRequest returns the best-effort real client IP for r.
-//
-// Algorithm:
-//  1. Parse the direct connection IP (RemoteAddr).
-//  2. If the direct IP is in trusted, walk X-Forwarded-For right-to-left,
-//     stopping at the first non-trusted IP — that is the client.
-//  3. If nothing trusted, fall back to the raw RemoteAddr IP.
-//
-// X-Real-IP is considered only if X-Forwarded-For is absent and the direct
-// connection is trusted.
-func FromRequest(r *http.Request, trusted TrustedProxies) string {
-	directIP, _, err := net.SplitHostPort(r.RemoteAddr)
+// FromRequest resolves using the legacy XFF then X-Real-IP behavior.
+// Deprecated: construct a Resolver with New and call Resolve.
+func FromRequest(req *http.Request, trusted TrustedProxies) string {
+	directIP, _, err := net.SplitHostPort(req.RemoteAddr)
 	if err != nil {
-		directIP = r.RemoteAddr
+		directIP = req.RemoteAddr
 	}
 	direct := net.ParseIP(directIP)
-
 	if direct == nil || !trusted.Contains(direct) {
 		return directIP
 	}
-
-	// Direct connection is a trusted proxy — examine X-Forwarded-For.
-	xff := r.Header.Get("X-Forwarded-For")
-	if xff != "" {
+	if xff := req.Header.Get(HeaderXForwardedFor); xff != "" {
 		parts := strings.Split(xff, ",")
-		// Walk right-to-left; the rightmost non-trusted IP is the real client.
 		for i := len(parts) - 1; i >= 0; i-- {
 			candidate := strings.TrimSpace(parts[i])
-			ip := net.ParseIP(candidate)
-			if ip == nil {
-				continue
-			}
-			if !trusted.Contains(ip) {
+			if ip := net.ParseIP(candidate); ip != nil && !trusted.Contains(ip) {
 				return candidate
 			}
 		}
 	}
-
-	// Fall back to X-Real-IP if present and direct is trusted.
-	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+	if xri := strings.TrimSpace(req.Header.Get(HeaderXRealIP)); xri != "" {
 		if ip := net.ParseIP(xri); ip != nil && !trusted.Contains(ip) {
 			return xri
 		}
 	}
-
 	return directIP
 }
 
-// contextKey is the key for the client IP stored in the request context.
 type contextKey struct{}
 
-// FromContext retrieves the client IP previously set by the middleware.
-// Returns empty string if not set.
+// FromContext retrieves a client IP previously stored in ctx.
 func FromContext(ctx context.Context) string {
-	if v, ok := ctx.Value(contextKey{}).(string); ok {
-		return v
+	if value, ok := ctx.Value(contextKey{}).(string); ok {
+		return value
 	}
 	return ""
 }
 
-// WithContext returns a new context carrying the given client IP.
+// WithContext returns a context carrying ip.
 func WithContext(ctx context.Context, ip string) context.Context {
 	return context.WithValue(ctx, contextKey{}, ip)
 }

@@ -23,5 +23,10 @@ It does not replace PostgreSQL migration tests, behavioral tests, or consumer
 validation. Experimental packages can change before v1, but those changes are
 still reviewed and documented.
 
+The `httpx/clientip` resolver introduced after v0.2.0 is additive. Its legacy
+`TrustedProxies`, `ParseTrustedProxies`, `MustParseTrustedProxies`, `Contains`,
+and `FromRequest` declarations remain source-compatible during the v0.2 release
+line while consumers migrate to `Resolver`.
+
 For private module access, set `GOPRIVATE=github.com/andreunix/*` and configure
 Git authentication before `go mod download`.
