@@ -189,7 +189,7 @@ match headers that this trusted boundary overwrites. See
 Pin a tagged release in consuming applications:
 
 ```bash
-go get github.com/andreunix/devengine@v0.3.0
+go get github.com/andreunix/devengine@v0.4.0
 ```
 
 ## CI

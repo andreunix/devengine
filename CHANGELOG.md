@@ -6,6 +6,8 @@ between stable-candidate and experimental packages until v1.0.0.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-03
+
 ### Added
 
 - Domain-neutral `secrets` primitives for compatible opaque values, SHA-256
@@ -74,7 +76,8 @@ between stable-candidate and experimental packages until v1.0.0.
 
 - Initial development release.
 
-[Unreleased]: https://github.com/andreunix/devengine/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/andreunix/devengine/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/andreunix/devengine/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/andreunix/devengine/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/andreunix/devengine/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/andreunix/devengine/releases/tag/v0.1.0

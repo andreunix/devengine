@@ -5,7 +5,7 @@ experimental APIs; stable-candidate APIs receive the same compatibility review
 intended for v1 and should only break when the release notes include a migration
 path. Patch releases must remain backward compatible.
 
-The current release line is `v0.3.x`. Consumers should pin an explicit tagged
+The current release line is `v0.4.x`. Consumers should pin an explicit tagged
 version in `go.mod`; `main` is development state and is not a release channel.
 
 ## Package status

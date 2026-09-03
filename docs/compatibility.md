@@ -25,7 +25,7 @@ still reviewed and documented.
 
 The `httpx/clientip` resolver introduced after v0.2.0 is additive. Its legacy
 `TrustedProxies`, `ParseTrustedProxies`, `MustParseTrustedProxies`, `Contains`,
-and `FromRequest` declarations remain source-compatible during the v0.3 release
+and `FromRequest` declarations remain source-compatible during the v0.4 release
 line while consumers migrate to `Resolver`.
 
 Consumers should pin an explicit release tag rather than depending on `main`.
