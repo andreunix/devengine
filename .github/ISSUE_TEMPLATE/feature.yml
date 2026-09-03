@@ -1,0 +1,22 @@
+name: Feature proposal
+description: Propose a domain-neutral engine capability
+title: "[Proposal] "
+body:
+  - type: textarea
+    attributes:
+      label: Problem
+      description: Describe the reusable infrastructure problem, not only one product's implementation.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed contract
+      description: Describe the public API and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Compatibility
+      description: Explain migration, versioning, and operational impact.
+    validations:
+      required: true

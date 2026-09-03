@@ -12,6 +12,13 @@ between stable-candidate and experimental packages until v1.0.0.
   digests, and AES-256-GCM encryption of small values at rest.
 - A domain-neutral SMTP transport with STARTTLS/implicit TLS, authentication,
   bounded I/O, address/header validation, and no message or credential logging.
+- Public-project governance with an MIT license, contribution guidelines, and
+  coordinated security reporting.
+
+### Changed
+
+- Removed the repository-scoped VPS runner workflow before making the project
+  public; resilience tests remain available for trusted local execution.
 
 ## [0.3.0] - 2026-09-03
 

@@ -30,9 +30,6 @@ jobs:
 
   dependency-review:
     name: Dependency review
-    # GitHub Dependency Review for private repositories requires GitHub Code
-    # Security. Run automatically when the repository is public; private
-    # repositories enable this job after licensing the feature.
     if: github.event_name == 'pull_request' && github.repository_visibility == 'public'
     runs-on: ubuntu-latest
     permissions:
@@ -43,8 +40,6 @@ jobs:
 
   codeql:
     name: CodeQL
-    # Private repositories require GitHub Code Security for CodeQL default
-    # setup. Keep this gate ready without making CI fail on unsupported plans.
     if: github.repository_visibility == 'public'
     runs-on: ubuntu-latest
     permissions:

@@ -184,10 +184,13 @@ match headers that this trusted boundary overwrites. See
 [`docs/client-ip.md`](docs/client-ip.md) and the executable
 [`examples/clientip`](examples/clientip).
 
-## Private module access
+## Installation
 
-While the module is private, configure `GOPRIVATE=github.com/andreunix/*` and
-GitHub credentials locally and in CI before `go get` or `go mod download`.
+Pin a tagged release in consuming applications:
+
+```bash
+go get github.com/andreunix/devengine@v0.3.0
+```
 
 ## CI
 
@@ -199,10 +202,9 @@ Runnable, compile-checked examples live under [`examples/`](examples). Version
 stability, platform support, and the release process are documented in
 [`docs/versioning.md`](docs/versioning.md),
 [`docs/compatibility.md`](docs/compatibility.md), and
-[`docs/releasing.md`](docs/releasing.md). Repository rulesets and GitHub secret
-scanning remain administrator-managed settings; see the release guide for the
-required controls.
+[`docs/releasing.md`](docs/releasing.md). See [`CONTRIBUTING.md`](CONTRIBUTING.md)
+before contributing and [`SECURITY.md`](SECURITY.md) for vulnerability reports.
 
 ## License
 
-MIT
+[MIT](LICENSE)

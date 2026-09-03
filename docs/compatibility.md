@@ -28,5 +28,4 @@ The `httpx/clientip` resolver introduced after v0.2.0 is additive. Its legacy
 and `FromRequest` declarations remain source-compatible during the v0.3 release
 line while consumers migrate to `Resolver`.
 
-For private module access, set `GOPRIVATE=github.com/andreunix/*` and configure
-Git authentication before `go mod download`.
+Consumers should pin an explicit release tag rather than depending on `main`.
