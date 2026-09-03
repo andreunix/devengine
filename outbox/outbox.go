@@ -401,7 +401,11 @@ func (r *Relay) startLeaseRenewal(parent context.Context, logger *slog.Logger, m
 			case <-renewalCtx.Done():
 				return
 			case <-ticker.C:
-				tag, err := r.Pool.Exec(renewalCtx, `
+				// Do not cancel an update already sent to PostgreSQL when stop is
+				// called. pgx may acknowledge query cancellation before the server
+				// has finished handling it, allowing the lease to change after stop
+				// returns. The parent still bounds the query during shutdown.
+				tag, err := r.Pool.Exec(parent, `
 					UPDATE outbox_messages
 					SET process_after = NOW() + $3::interval,
 					    locked_until = NOW() + $3::interval

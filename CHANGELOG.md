@@ -22,6 +22,11 @@ between stable-candidate and experimental packages until v1.0.0.
 - Removed the repository-scoped VPS runner workflow before making the project
   public; resilience tests remain available for trusted local execution.
 
+### Fixed
+
+- Outbox lease renewal shutdown now waits for an update already sent to
+  PostgreSQL, preventing the lease from changing after `stop` returns.
+
 ## [0.3.0] - 2026-09-03
 
 ### Added
